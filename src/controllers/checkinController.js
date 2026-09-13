@@ -7,13 +7,19 @@ const { encrypt, decrypt } = require('../services/encryption');
 const { scheduleWhatsApp } = require('../services/whatsappService');
 
 // ── Helpers ────────────────────────────────────────────────
-function paise(val) { return Math.round(parseFloat(val || 0) * 100); }
+// FIX: removed * 100 — input fields are named _paise, so values arrive in paise already.
+// This now matches paymentsController.paise() which also does NOT multiply.
+function paise(val) { return Math.round(parseFloat(val || 0)); }
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 /**
  * POST /api/v1/residents
  * Full check-in: validate → insert resident → create deposit ledger entry →
  * flip bed to occupied → audit → WhatsApp confirmation.
+ *
+ * FIX: Allows check-in on 'reserved' beds (from confirmed bookings).
+ * FIX: Advance payment recorded as type='advance', not 'rent'.
+ * FIX: paise() no longer double-converts.
  */
 function checkIn(req, res) {
   const db         = getDb();
@@ -38,9 +44,6 @@ function checkIn(req, res) {
   if (!aadhaar_consent) {
     return res.status(400).json({ error: 'aadhaar_consent must be true before check-in' });
   }
-  if (!rentPaiseRaw && rentPaiseRaw !== 0) {
-    return res.status(400).json({ error: 'monthly_rent_paise is required' });
-  }
 
   const mobileClean = String(mobile).replace(/\D/g, '');
   if (mobileClean.length < 10 || mobileClean.length > 12) {
@@ -56,19 +59,24 @@ function checkIn(req, res) {
     return res.status(400).json({ error: 'expected_checkout must be after check_in_date' });
   }
 
-  const rentPaise    = paise(rentPaiseRaw);
+  // ── Bed availability ──────────────────────────────────────
+  const bed = db.prepare('SELECT * FROM beds WHERE id = ? AND property_id = ?').get(bed_id, propertyId);
+  if (!bed) return res.status(404).json({ error: 'Bed not found' });
+
+  // FIX: Allow 'reserved' beds (from bookings) in addition to 'available'
+  if (bed.status !== 'available' && bed.status !== 'reserved') {
+    return res.status(409).json({ error: `Bed is '${bed.status}' — only available or reserved beds can be checked in to` });
+  }
+
+  // FIX: If bed has a base_rate and no rent was provided, default to bed rate
+  const rentPaise    = (rentPaiseRaw !== undefined && rentPaiseRaw !== null && rentPaiseRaw !== '')
+    ? paise(rentPaiseRaw)
+    : (bed.base_rate_paise || 0);
   const depositPaise = paise(depositPaiseRaw);
   const paidPaise    = paise(paidPaiseRaw);
 
   if (rentPaise < 0)    return res.status(400).json({ error: 'monthly_rent_paise must be ≥ 0' });
   if (depositPaise < 0) return res.status(400).json({ error: 'deposit_paise must be ≥ 0' });
-
-  // ── Bed availability ──────────────────────────────────────
-  const bed = db.prepare('SELECT * FROM beds WHERE id = ? AND property_id = ?').get(bed_id, propertyId);
-  if (!bed) return res.status(404).json({ error: 'Bed not found' });
-  if (bed.status !== 'available') {
-    return res.status(409).json({ error: `Bed is '${bed.status}' — only available beds can be checked in to` });
-  }
 
   // ── Aadhaar AES-256 encryption ────────────────────────────
   const aadhaarEncrypted = aadhaar_number ? encrypt(String(aadhaar_number)) : null;
@@ -90,7 +98,7 @@ function checkIn(req, res) {
          photo_path, check_in_date, expected_checkout, rent_due_day,
          monthly_rent_paise, deposit_paise, status,
          notes, checkin_by, created_at, updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,  'active',?,?,?,?)
+      VALUES (?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,  'active',?,?,?,?)
     `).run(
       residentId, propertyId, bed_id, full_name, mobileClean,
       aadhaarEncrypted, aadhaarLast4, aadhaar_mobile || null, aadhaar_photo_path || null,
@@ -116,23 +124,33 @@ function checkIn(req, res) {
       );
     }
 
-    // Initial advance rent payment
+    // FIX: Initial advance payment — recorded as type='advance', not 'rent'.
+    // This prevents it from being mistaken for month-1 rent payment in
+    // reminders, payment badges, and monthly invoice generation.
     if (paidPaise > 0) {
       db.prepare(`
         INSERT INTO payment_ledger
           (id,property_id,resident_id,billing_month,amount_paise,direction,type,
            payment_mode,gateway_txn_id,paid_at,requires_approval,approval_status,notes,recorded_by,created_at)
-        VALUES (?,?,?,?,?,'credit','rent',?,?,?,0,'not_required',?,?,?)
+        VALUES (?,?,?,?,?,'credit','advance',?,?,?,0,'not_required',?,?,?)
       `).run(
         uuidv4(), propertyId, residentId, billingMonth, paidPaise,
         payment_mode || 'cash', gateway_txn_id || null, now,
-        'Advance rent on check-in', req.user.id, now
+        'Advance payment on check-in', req.user.id, now
       );
     }
 
     // Flip bed to occupied
-    db.prepare(`UPDATE beds SET status='occupied', cleaning_started_at=NULL, updated_at=datetime('now') WHERE id=?`)
+    db.prepare(`UPDATE beds SET status='occupied', cleaning_started_at=NULL, booking_request_id=NULL, updated_at=datetime('now') WHERE id=?`)
       .run(bed_id);
+
+    // FIX: If bed was reserved via a booking, link and confirm the booking
+    if (bed.status === 'reserved' && bed.booking_request_id) {
+      db.prepare(`
+        UPDATE booking_requests SET status='confirmed', converted_to_resident_id=?
+        WHERE id=? AND status IN ('pending','confirmed')
+      `).run(residentId, bed.booking_request_id);
+    }
   })();
 
   writeAudit({
@@ -159,23 +177,28 @@ function checkIn(req, res) {
 
 /**
  * GET /api/v1/residents
+ *
+ * FIX: Payment badge now checks CURRENT billing month only (not all-time sum).
+ * FIX: Includes type='advance' in paid total alongside 'rent'.
  */
 function listResidents(req, res) {
   const db         = getDb();
   const propertyId = req.user.property_id;
   const { status = 'active', search: rawSearch } = req.query;
   const search = rawSearch ? String(rawSearch).trim().substring(0, 100) : null;
+  const thisMonth = new Date().toISOString().substring(0, 7);
 
   let query = `
     SELECT r.id, r.full_name, r.mobile, r.aadhaar_last4,
       r.check_in_date, r.expected_checkout, r.actual_checkout,
       r.monthly_rent_paise, r.deposit_paise, r.status, r.rent_due_day,
       r.created_at, r.checkin_by,
-      b.bed_label, b.status as bed_status,
+      b.bed_label, b.status as bed_status, b.base_rate_paise,
       rm.room_number, f.label as floor_label,
       COALESCE((
         SELECT SUM(l.amount_paise) FROM payment_ledger l
-        WHERE l.resident_id = r.id AND l.type = 'rent' AND l.direction = 'credit'
+        WHERE l.resident_id = r.id AND l.type IN ('rent','advance') AND l.direction = 'credit'
+        AND l.billing_month = ?
       ), 0) as total_rent_paid_paise
     FROM residents r
     LEFT JOIN beds b ON b.id = r.bed_id
@@ -183,7 +206,7 @@ function listResidents(req, res) {
     LEFT JOIN floors f ON f.id = rm.floor_id
     WHERE r.property_id = ?
   `;
-  const params = [propertyId];
+  const params = [thisMonth, propertyId];
 
   if (status !== 'all') { query += ' AND r.status = ?'; params.push(status); }
   if (search) {
@@ -216,7 +239,7 @@ function getResident(req, res) {
   const propertyId = req.user.property_id;
 
   const resident = db.prepare(`
-    SELECT r.*, b.bed_label, rm.room_number, f.label as floor_label
+    SELECT r.*, b.bed_label, b.base_rate_paise, rm.room_number, f.label as floor_label
     FROM residents r
     LEFT JOIN beds b ON b.id = r.bed_id
     LEFT JOIN rooms rm ON rm.id = b.room_id
@@ -226,8 +249,8 @@ function getResident(req, res) {
 
   if (!resident) return res.status(404).json({ error: 'Resident not found' });
 
-  // DPDP: Log Aadhaar number access
-  if (resident.aadhaar_number_encrypted && req.user.role === 'owner') {
+  // DPDP: Log Aadhaar number access for owner AND manager roles
+  if (resident.aadhaar_number_encrypted && (req.user.role === 'owner' || req.user.role === 'manager')) {
     logDocumentAccess(db, {
       residentId:   resident.id,
       accessedBy:   req.user.id,
@@ -483,4 +506,39 @@ function extendStay(req, res) {
   return res.json({ message: 'Stay extended', resident: updated });
 }
 
-module.exports = { checkIn, listResidents, getResident, checkOut, approveCheckout, extendStay };
+/**
+ * PATCH /api/v1/residents/:id/rent
+ * Owner/Manager changes rent for an active resident without extending checkout.
+ */
+function updateResidentRent(req, res) {
+  const db         = getDb();
+  const propertyId = req.user.property_id;
+  const { id }     = req.params;
+  const { monthly_rent_paise, notes } = req.body;
+
+  if (monthly_rent_paise === undefined || monthly_rent_paise === null) {
+    return res.status(400).json({ error: 'monthly_rent_paise is required' });
+  }
+  const newRent = Math.round(parseFloat(monthly_rent_paise));
+  if (newRent < 0) return res.status(400).json({ error: 'monthly_rent_paise must be ≥ 0' });
+
+  const resident = db.prepare(
+    "SELECT * FROM residents WHERE id = ? AND property_id = ? AND status = 'active'"
+  ).get(id, propertyId);
+  if (!resident) return res.status(404).json({ error: 'Active resident not found' });
+
+  const oldRent = resident.monthly_rent_paise;
+  db.prepare(`UPDATE residents SET monthly_rent_paise=?, updated_at=datetime('now') WHERE id=?`)
+    .run(newRent, id);
+
+  writeAudit({
+    propertyId, userId: req.user.id, action: 'RENT_UPDATED',
+    entityType: 'resident', entityId: id,
+    snapshot: { old_rent_paise: oldRent, new_rent_paise: newRent, notes: notes || null },
+    ip: req.ip,
+  });
+
+  return res.json({ message: 'Rent updated', old_rent_paise: oldRent, new_rent_paise: newRent });
+}
+
+module.exports = { checkIn, listResidents, getResident, checkOut, approveCheckout, extendStay, updateResidentRent };
