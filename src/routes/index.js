@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * DormBook API Routes — v1
+ * DormBook API Routes — v2.1
  * Base path: /api/v1  (mounted in server.js)
  *
  * Role ladder: owner(3) > manager(2) > reception(1)
@@ -35,11 +35,15 @@ router.post('/auth/change-password', authenticate, auth.changePassword);
 router.get('/dashboard/summary',     authenticate, sameProperty, finance.getDashboard);
 
 // ── Beds ─────────────────────────────────────────────────────────────────
-router.get ('/beds',                 authenticate, sameProperty, beds.listBeds);
-router.post('/beds',                 authenticate, sameProperty, requireRole('manager'), beds.createBed);
-router.get ('/beds/:id',             authenticate, sameProperty, beds.getBed);
+router.get  ('/beds',                authenticate, sameProperty, beds.listBeds);
+router.post ('/beds',                authenticate, sameProperty, requireRole('manager'), beds.createBed);
+router.get  ('/beds/:id',            authenticate, sameProperty, beds.getBed);
 router.patch('/beds/:id/status',     authenticate, sameProperty, requireRole('reception'), beds.updateBedStatus);
-router.get ('/floors',               authenticate, sameProperty, beds.listFloors);
+// NEW: Owner/Manager sets the base monthly rate for a bed
+router.patch('/beds/:id/rate',       authenticate, sameProperty, requireRole('manager'), beds.updateBedRate);
+// NEW: Bulk rate update for multiple beds
+router.patch('/beds/bulk-rate',      authenticate, sameProperty, requireRole('manager'), beds.bulkUpdateBedRate);
+router.get  ('/floors',              authenticate, sameProperty, beds.listFloors);
 
 // ── Residents ─────────────────────────────────────────────────────────────
 router.post('/residents',                        authenticate, sameProperty, requireRole('reception'), checkin.checkIn);
@@ -48,6 +52,8 @@ router.get ('/residents/:id',                    authenticate, sameProperty, ass
 router.post('/residents/:id/checkout',           authenticate, sameProperty, requireRole('reception'), assertOwnsResource('residents'), checkin.checkOut);
 router.post('/residents/:id/checkout/approve',   authenticate, sameProperty, requireRole('manager'),   assertOwnsResource('residents'), checkin.approveCheckout);
 router.post('/residents/:id/extend',             authenticate, sameProperty, requireRole('manager'),   assertOwnsResource('residents'), checkin.extendStay);
+// NEW: Change rent for active resident without extending checkout
+router.patch('/residents/:id/rent',              authenticate, sameProperty, requireRole('manager'),   assertOwnsResource('residents'), checkin.updateResidentRent);
 
 // Resident ledger & refund
 router.get ('/residents/:id/ledger',             authenticate, sameProperty, assertOwnsResource('residents'), payments.getResidentLedger);
@@ -62,11 +68,18 @@ router.get ('/payments/pending-approvals',       authenticate, sameProperty, req
 router.post('/payments/:id/approve',             authenticate, sameProperty, requireRole('manager'), assertOwnsResource('payment_ledger'), payments.approvePayment);
 
 // ── Finance — manager+ for reports, owner-only for export & audit ─────────
-router.get ('/expenses',             authenticate, sameProperty, requireRole('manager'), finance.listExpenses);
-router.post('/expenses',             authenticate, sameProperty, requireRole('manager'), finance.addExpense);
-router.get ('/reports/summary',      authenticate, sameProperty, requireRole('manager'), finance.reportSummary);
-router.get ('/reports/export',       authenticate, sameProperty, requireRole('owner'),   finance.reportExport);
-router.get ('/audit',                authenticate, sameProperty, requireRole('owner'),   finance.getAuditLog);
+router.get   ('/expenses',           authenticate, sameProperty, requireRole('manager'), finance.listExpenses);
+router.post  ('/expenses',           authenticate, sameProperty, requireRole('manager'), finance.addExpense);
+// NEW: Edit and delete expenses (owner only)
+router.patch ('/expenses/:id',       authenticate, sameProperty, requireRole('owner'), finance.updateExpense);
+router.delete('/expenses/:id',       authenticate, sameProperty, requireRole('owner'), finance.deleteExpense);
+router.get   ('/reports/summary',    authenticate, sameProperty, requireRole('manager'), finance.reportSummary);
+router.get   ('/reports/export',     authenticate, sameProperty, requireRole('owner'),   finance.reportExport);
+router.get   ('/audit',              authenticate, sameProperty, requireRole('owner'),   finance.getAuditLog);
+
+// ── Property Settings (owner only) ────────────────────────────────────────
+// NEW: Owner can update property config (cleaning timeout, refund threshold, WhatsApp number, etc.)
+router.patch('/properties/settings', authenticate, sameProperty, requireRole('owner'), finance.updatePropertySettings);
 
 // ── Staff ─────────────────────────────────────────────────────────────────
 router.get   ('/staff',              authenticate, sameProperty, requireRole('manager'), staff.listStaff);
@@ -129,7 +142,7 @@ function verifyWebhookSecret(req, res, next) {
 
 // ── Health check ─────────────────────────────────────────────────────────
 router.get('/health', (req, res) => {
-  res.json({ status: 'ok', version: '2.0.0', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', version: '2.1.0', timestamp: new Date().toISOString() });
 });
 
 module.exports = router;
