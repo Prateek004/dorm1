@@ -1,5 +1,5 @@
 -- ============================================================
--- DormBook — SQLite Schema v2.0 (Production)
+-- DormBook — SQLite Schema v2.1 (Production)
 -- All monetary values in PAISE (integer). UTC timestamps.
 -- ============================================================
 
@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS beds (
   room_id             TEXT NOT NULL,
   property_id         TEXT NOT NULL,
   bed_label           TEXT NOT NULL,
+  base_rate_paise     INTEGER NOT NULL DEFAULT 0,
   status              TEXT NOT NULL DEFAULT 'available'
                         CHECK (status IN ('available','occupied','reserved','cleaning','pending')),
   cleaning_started_at TEXT,
