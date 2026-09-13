@@ -3,9 +3,16 @@
 const ExcelJS  = require('exceljs');
 const PDFKit   = require('pdfkit');
 const { getDb } = require('../db/connection');
-const { stripFinancial } = require('../middleware/auth');
+const { writeAudit } = require('../middleware/auditLog');
 
-/** GET /api/v1/dashboard/summary */
+/**
+ * GET /api/v1/dashboard/summary
+ *
+ * FIX: Replaced COUNT(*) FILTER (WHERE ...) with SUM(CASE WHEN ... END).
+ * FILTER syntax is PostgreSQL-native and only works in SQLite ≥ 3.30.0.
+ * SUM(CASE) works on every SQLite version — eliminates the "shows 0" bug
+ * if the bundled SQLite is older.
+ */
 function getDashboard(req, res) {
   const db         = getDb();
   const propertyId = req.user.property_id;
@@ -14,12 +21,12 @@ function getDashboard(req, res) {
 
   const occupancy = db.prepare(`
     SELECT
-      COUNT(*) FILTER (WHERE status='available') as available,
-      COUNT(*) FILTER (WHERE status='occupied')  as occupied,
-      COUNT(*) FILTER (WHERE status='cleaning')  as cleaning,
-      COUNT(*) FILTER (WHERE status='reserved')  as reserved,
-      COUNT(*) FILTER (WHERE status='pending')   as pending,
-      COUNT(*)                                   as total
+      SUM(CASE WHEN status='available' THEN 1 ELSE 0 END) as available,
+      SUM(CASE WHEN status='occupied'  THEN 1 ELSE 0 END) as occupied,
+      SUM(CASE WHEN status='cleaning'  THEN 1 ELSE 0 END) as cleaning,
+      SUM(CASE WHEN status='reserved'  THEN 1 ELSE 0 END) as reserved,
+      SUM(CASE WHEN status='pending'   THEN 1 ELSE 0 END) as pending,
+      COUNT(*)                                              as total
     FROM beds WHERE property_id = ?
   `).get(propertyId);
 
@@ -54,7 +61,7 @@ function getDashboard(req, res) {
       WHERE r.property_id = ? AND r.status = 'active'
       AND (
         SELECT COALESCE(SUM(pl.amount_paise),0) FROM payment_ledger pl
-        WHERE pl.resident_id = r.id AND pl.type='rent' AND pl.direction='credit'
+        WHERE pl.resident_id = r.id AND pl.type IN ('rent','advance') AND pl.direction='credit'
         AND pl.billing_month = ?
       ) < r.monthly_rent_paise
     `).get(propertyId, thisMonth);
@@ -95,7 +102,6 @@ function listExpenses(req, res) {
 /** POST /api/v1/expenses */
 function addExpense(req, res) {
   const { v4: uuidv4 } = require('uuid');
-  const { writeAudit }  = require('../middleware/auditLog');
   const db = getDb();
   const propertyId = req.user.property_id;
   const { category, description, amount_paise, expense_date, payment_mode, receipt_path } = req.body;
@@ -123,6 +129,124 @@ function addExpense(req, res) {
   });
 
   return res.status(201).json(db.prepare('SELECT * FROM expenses WHERE id=?').get(id));
+}
+
+/**
+ * PATCH /api/v1/expenses/:id
+ * Fix a wrong expense entry. Owner only.
+ */
+function updateExpense(req, res) {
+  const { v4: uuidv4 } = require('uuid');
+  const db = getDb();
+  const propertyId = req.user.property_id;
+
+  const expense = db.prepare('SELECT * FROM expenses WHERE id = ? AND property_id = ?')
+    .get(req.params.id, propertyId);
+  if (!expense) return res.status(404).json({ error: 'Expense not found' });
+
+  const { category, description, amount_paise, expense_date, payment_mode } = req.body;
+
+  const newAmount = amount_paise !== undefined ? Math.round(parseFloat(amount_paise)) : expense.amount_paise;
+  if (newAmount <= 0) return res.status(400).json({ error: 'amount_paise must be > 0' });
+
+  db.prepare(`
+    UPDATE expenses SET category=COALESCE(?,category), description=COALESCE(?,description),
+    amount_paise=?, expense_date=COALESCE(?,expense_date), payment_mode=COALESCE(?,payment_mode)
+    WHERE id=?
+  `).run(
+    category || null, description !== undefined ? description : null,
+    newAmount, expense_date || null, payment_mode || null, req.params.id
+  );
+
+  writeAudit({
+    propertyId, userId: req.user.id, action: 'EXPENSE_UPDATED',
+    entityType: 'expenses', entityId: req.params.id,
+    amountPaise: newAmount,
+    snapshot: { old: expense, updated_fields: req.body },
+    ip: req.ip,
+  });
+
+  return res.json(db.prepare('SELECT * FROM expenses WHERE id=?').get(req.params.id));
+}
+
+/**
+ * DELETE /api/v1/expenses/:id
+ * Remove a wrong expense entry. Owner only.
+ */
+function deleteExpense(req, res) {
+  const db = getDb();
+  const propertyId = req.user.property_id;
+
+  const expense = db.prepare('SELECT * FROM expenses WHERE id = ? AND property_id = ?')
+    .get(req.params.id, propertyId);
+  if (!expense) return res.status(404).json({ error: 'Expense not found' });
+
+  db.prepare('DELETE FROM expenses WHERE id = ?').run(req.params.id);
+
+  writeAudit({
+    propertyId, userId: req.user.id, action: 'EXPENSE_DELETED',
+    entityType: 'expenses', entityId: req.params.id,
+    amountPaise: expense.amount_paise,
+    snapshot: expense,
+    ip: req.ip,
+  });
+
+  return res.json({ message: 'Expense deleted' });
+}
+
+/**
+ * PATCH /api/v1/properties/settings
+ * Owner updates property configuration.
+ */
+function updatePropertySettings(req, res) {
+  const db = getDb();
+  const propertyId = req.user.property_id;
+
+  const prop = db.prepare('SELECT * FROM properties WHERE id = ?').get(propertyId);
+  if (!prop) return res.status(404).json({ error: 'Property not found' });
+
+  const {
+    name, address, city, state, pincode, whatsapp_number,
+    cleaning_timeout_minutes, refund_approval_threshold_paise,
+    daily_summary_time, eod_report_time, timezone,
+    cash_reconciliation_tolerance_paise, booking_lock_hours, property_code,
+  } = req.body;
+
+  db.prepare(`
+    UPDATE properties SET
+      name=COALESCE(?,name), address=COALESCE(?,address), city=COALESCE(?,city),
+      state=COALESCE(?,state), pincode=COALESCE(?,pincode),
+      whatsapp_number=COALESCE(?,whatsapp_number),
+      cleaning_timeout_minutes=COALESCE(?,cleaning_timeout_minutes),
+      refund_approval_threshold_paise=COALESCE(?,refund_approval_threshold_paise),
+      daily_summary_time=COALESCE(?,daily_summary_time),
+      eod_report_time=COALESCE(?,eod_report_time),
+      timezone=COALESCE(?,timezone),
+      cash_reconciliation_tolerance_paise=COALESCE(?,cash_reconciliation_tolerance_paise),
+      booking_lock_hours=COALESCE(?,booking_lock_hours),
+      property_code=COALESCE(?,property_code),
+      updated_at=datetime('now')
+    WHERE id=?
+  `).run(
+    name || null, address || null, city || null, state || null, pincode || null,
+    whatsapp_number || null,
+    cleaning_timeout_minutes !== undefined ? cleaning_timeout_minutes : null,
+    refund_approval_threshold_paise !== undefined ? refund_approval_threshold_paise : null,
+    daily_summary_time || null, eod_report_time || null, timezone || null,
+    cash_reconciliation_tolerance_paise !== undefined ? cash_reconciliation_tolerance_paise : null,
+    booking_lock_hours !== undefined ? booking_lock_hours : null,
+    property_code || null,
+    propertyId
+  );
+
+  writeAudit({
+    propertyId, userId: req.user.id, action: 'PROPERTY_SETTINGS_UPDATED',
+    entityType: 'properties', entityId: propertyId,
+    snapshot: { updated_fields: req.body },
+    ip: req.ip,
+  });
+
+  return res.json(db.prepare('SELECT * FROM properties WHERE id = ?').get(propertyId));
 }
 
 /** GET /api/v1/reports/summary */
@@ -302,4 +426,7 @@ function getAuditLog(req, res) {
   return res.json(db.prepare(q).all(...params));
 }
 
-module.exports = { getDashboard, listExpenses, addExpense, reportSummary, reportExport, getAuditLog };
+module.exports = {
+  getDashboard, listExpenses, addExpense, updateExpense, deleteExpense,
+  updatePropertySettings, reportSummary, reportExport, getAuditLog,
+};
