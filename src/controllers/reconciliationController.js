@@ -5,7 +5,12 @@ const { getDb }       = require('../db/connection');
 const { writeAudit }  = require('../middleware/auditLog');
 const { scheduleWhatsApp } = require('../services/whatsappService');
 
-/** POST /api/v1/reconciliation/cash */
+/**
+ * POST /api/v1/reconciliation/cash
+ *
+ * FIX: System total now = cash credits − cash debits (refunds).
+ * Previously only counted credits, so any cash refund created a phantom discrepancy.
+ */
 function closeCashDrawer(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
@@ -16,14 +21,21 @@ function closeCashDrawer(req, res) {
   }
   const drawerPaise = Math.round(parseFloat(drawer_amount_paise));
 
-  // System cash for the day
-  const systemRow = db.prepare(`
+  // FIX: Cash IN (credits) for the day
+  const cashIn = db.prepare(`
     SELECT COALESCE(SUM(amount_paise), 0) as total FROM payment_ledger
     WHERE property_id = ? AND payment_mode = 'cash' AND direction = 'credit'
     AND date(paid_at) = ?
   `).get(propertyId, date);
 
-  const systemPaise = systemRow.total;
+  // FIX: Cash OUT (refunds paid in cash) for the day
+  const cashOut = db.prepare(`
+    SELECT COALESCE(SUM(amount_paise), 0) as total FROM payment_ledger
+    WHERE property_id = ? AND payment_mode = 'cash' AND direction = 'debit'
+    AND date(paid_at) = ? AND approval_status != 'rejected'
+  `).get(propertyId, date);
+
+  const systemPaise = cashIn.total - cashOut.total;
   const deltaPaise  = drawerPaise - systemPaise;
 
   const prop = db.prepare('SELECT cash_reconciliation_tolerance_paise FROM properties WHERE id = ?').get(propertyId);
@@ -44,7 +56,7 @@ function closeCashDrawer(req, res) {
     propertyId, userId: req.user.id, action: 'CASH_RECONCILIATION',
     entityType: 'cash_reconciliations', entityId: id,
     amountPaise: deltaPaise,
-    snapshot: { date, drawer: drawerPaise, system: systemPaise, delta: deltaPaise, is_discrepancy: isDiscrepancy },
+    snapshot: { date, drawer: drawerPaise, system: systemPaise, cash_in: cashIn.total, cash_out: cashOut.total, delta: deltaPaise, is_discrepancy: isDiscrepancy },
     ip: req.ip,
   });
 
