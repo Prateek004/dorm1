@@ -34,7 +34,29 @@ function openDb(dbPath) {
   db.pragma('foreign_keys = ON');
   db.pragma('busy_timeout = 5000');
 
+  // Run safe migrations for existing databases
+  runMigrations(db);
+
   return db;
+}
+
+/**
+ * Safe migrations — adds new columns to existing tables.
+ * Each migration checks if the column exists before ALTER TABLE.
+ * This runs on every startup and is fully idempotent.
+ */
+function runMigrations(db) {
+  const getColumns = (table) =>
+    db.prepare(`SELECT name FROM pragma_table_info('${table}')`).all().map(c => c.name);
+
+  // v2.1: Add base_rate_paise to beds (owner-set bed price)
+  const bedCols = getColumns('beds');
+  if (!bedCols.includes('base_rate_paise')) {
+    db.exec("ALTER TABLE beds ADD COLUMN base_rate_paise INTEGER NOT NULL DEFAULT 0");
+    console.log('[MIGRATION] Added beds.base_rate_paise');
+  }
+
+  console.log('[DB] Migrations complete');
 }
 
 module.exports = { initDb, DB_PATH };
