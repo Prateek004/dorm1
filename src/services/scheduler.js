@@ -33,14 +33,21 @@ function startScheduler() {
   // ── 4. Booking expiry — every 15 min ─────────────────────
   cron.schedule('*/15 * * * *', releaseExpiredBookings, { name: 'booking-expiry' });
 
-  // ── 5. Monthly invoice generation — 1st of month at 08:00
-  cron.schedule('0 8 1 * *', generateMonthlyInvoices, { name: 'monthly-invoices' });
-
-  // ── 6. Overstay alert — daily at 10:00 ───────────────────
+  // ── 5. Overstay alert — daily at 10:00 ───────────────────
   cron.schedule('0 10 * * *', sendOverstayAlerts, { name: 'overstay-alerts' });
+
+  // NOTE: Removed generateMonthlyInvoices cron job.
+  // It was creating ₹0 phantom ledger entries (type='rent', amount=0, direction='credit')
+  // that corrupted revenue reports and blocked real invoice generation.
+  // Billing obligations are derived from residents.monthly_rent_paise — no synthetic entries needed.
 }
 
 // ── Rent Reminders (tiered: 3d before, due, 3d over, 7d over) ──────────────
+/**
+ * FIX: Now includes type='advance' alongside 'rent' when checking paid total.
+ * Previously, advance payments at check-in were recorded as 'rent',
+ * but now they're 'advance' — so both types must be summed.
+ */
 function sendTieredRentReminders() {
   const db    = getDb();
   const today = new Date().toISOString().substring(0, 10);
@@ -50,7 +57,7 @@ function sendTieredRentReminders() {
     SELECT r.id, r.full_name, r.mobile, r.monthly_rent_paise, r.rent_due_day, r.property_id,
       COALESCE((
         SELECT SUM(pl.amount_paise) FROM payment_ledger pl
-        WHERE pl.resident_id = r.id AND pl.type = 'rent'
+        WHERE pl.resident_id = r.id AND pl.type IN ('rent','advance')
         AND pl.billing_month = ? AND pl.direction = 'credit'
       ), 0) as paid_paise
     FROM residents r
@@ -94,6 +101,10 @@ function sendTieredRentReminders() {
 }
 
 // ── EOD Report ──────────────────────────────────────────────────────────────
+/**
+ * FIX: Replaced COUNT(*) FILTER (WHERE ...) with SUM(CASE WHEN ... END)
+ * for SQLite compatibility.
+ */
 function sendEodReport() {
   const db    = getDb();
   const today = new Date().toISOString().substring(0, 10);
@@ -107,8 +118,8 @@ function sendEodReport() {
 
     const occupancy = db.prepare(`
       SELECT
-        COUNT(*) FILTER (WHERE status='occupied')  as occupied,
-        COUNT(*) FILTER (WHERE status='available') as available,
+        SUM(CASE WHEN status='occupied'  THEN 1 ELSE 0 END) as occupied,
+        SUM(CASE WHEN status='available' THEN 1 ELSE 0 END) as available,
         COUNT(*) as total
       FROM beds WHERE property_id=?
     `).get(prop.id);
@@ -118,7 +129,7 @@ function sendEodReport() {
       WHERE r.property_id=? AND r.status='active'
       AND (
         SELECT COALESCE(SUM(pl.amount_paise),0) FROM payment_ledger pl
-        WHERE pl.resident_id=r.id AND pl.type='rent' AND pl.billing_month=?
+        WHERE pl.resident_id=r.id AND pl.type IN ('rent','advance') AND pl.billing_month=?
       ) < r.monthly_rent_paise
     `).get(prop.id, today.substring(0,7));
 
@@ -128,7 +139,7 @@ function sendEodReport() {
       eventType: 'eod_report',
       templateData: {
         date: today, collection: collection.total / 100,
-        occupied: occupancy.occupied, available: occupancy.available,
+        occupied: occupancy.occupied || 0, available: occupancy.available || 0,
         overdue: overdue.count,
       },
     }).catch(err => console.error('[SCHEDULER] EOD error:', err.message));
@@ -172,42 +183,11 @@ function releaseExpiredBookings() {
   console.log(`[SCHEDULER] Released ${expired.length} expired booking(s)`);
 }
 
-// ── Monthly Invoice Generation ─────────────────────────────────────────────
-function generateMonthlyInvoices() {
-  const db = getDb();
-  const { generateReceipt } = require('./receiptService');
-  const { v4: uuidv4 } = require('uuid');
-  const thisMonth = new Date().toISOString().substring(0, 7);
-  const now = new Date().toISOString();
-
-  const residents = db.prepare(`
-    SELECT r.* FROM residents r WHERE r.status = 'active'
-  `).all();
-
-  let created = 0;
-  residents.forEach(r => {
-    // Skip if rent already recorded for this month
-    const existing = db.prepare(`
-      SELECT id FROM payment_ledger WHERE resident_id=? AND type='rent' AND billing_month=?
-    `).get(r.id, thisMonth);
-    if (existing) return;
-
-    // Only create unpaid invoice entry (amount=0 is a due record)
-    const paymentId = uuidv4();
-    db.prepare(`
-      INSERT INTO payment_ledger
-        (id,property_id,resident_id,billing_month,amount_paise,direction,type,
-         payment_mode,paid_at,requires_approval,approval_status,notes,recorded_by,created_at)
-      VALUES (?,?,?,?,0,'credit','rent','cash',?,0,'not_required','Monthly invoice — due',
-        (SELECT id FROM users WHERE property_id=? AND role='owner' LIMIT 1),?)
-    `).run(paymentId, r.property_id, r.id, thisMonth, now, r.property_id, now);
-    created++;
-  });
-
-  console.log(`[SCHEDULER] Created ${created} monthly invoice records for ${thisMonth}`);
-}
-
 // ── Overstay Alerts ─────────────────────────────────────────────────────────
+/**
+ * FIX: Uses distinct 'overstay_alert' event type instead of reusing 'rent_overdue_7d'.
+ * The owner gets a clear message about checkout being overdue, not a confusing rent reminder.
+ */
 function sendOverstayAlerts() {
   const db    = getDb();
   const today = new Date().toISOString().substring(0, 10);
@@ -221,12 +201,12 @@ function sendOverstayAlerts() {
   overstayers.forEach(r => {
     const days = Math.floor((new Date(today) - new Date(r.expected_checkout)) / 86400000);
     console.warn(`[SCHEDULER] Overstay: ${r.full_name} (${days} days past checkout ${r.expected_checkout})`);
-    // Alert owner
+    // Alert owner with distinct event type
     scheduleWhatsApp({
       propertyId: r.property_id, residentId: r.id,
       recipientMobile: '', recipientType: 'owner',
-      eventType: 'rent_overdue_7d', // reuse overdue template for overstay alert
-      templateData: { name: r.full_name, amount: 0, days_overdue: days },
+      eventType: 'overstay_alert',
+      templateData: { name: r.full_name, expected_checkout: r.expected_checkout, days_overdue: days },
     }).catch(() => {});
   });
 
