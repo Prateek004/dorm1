@@ -80,23 +80,102 @@ function updateBedStatus(req, res) {
   return res.json(db.prepare('SELECT * FROM beds WHERE id = ?').get(req.params.id));
 }
 
+/**
+ * PATCH /api/v1/beds/:id/rate
+ * Owner/Manager sets the base rate for a bed.
+ * This becomes the default monthly_rent_paise for new check-ins on this bed.
+ */
+function updateBedRate(req, res) {
+  const db = getDb();
+  const propertyId = req.user.property_id;
+  const { base_rate_paise } = req.body;
+
+  if (base_rate_paise === undefined || base_rate_paise === null) {
+    return res.status(400).json({ error: 'base_rate_paise is required' });
+  }
+  const ratePaise = Math.round(parseFloat(base_rate_paise));
+  if (ratePaise < 0) return res.status(400).json({ error: 'base_rate_paise must be ≥ 0' });
+
+  const bed = db.prepare('SELECT * FROM beds WHERE id = ? AND property_id = ?')
+    .get(req.params.id, propertyId);
+  if (!bed) return res.status(404).json({ error: 'Bed not found' });
+
+  const oldRate = bed.base_rate_paise || 0;
+  db.prepare(`UPDATE beds SET base_rate_paise=?, updated_at=datetime('now') WHERE id=?`)
+    .run(ratePaise, req.params.id);
+
+  writeAudit({
+    propertyId, userId: req.user.id,
+    action: 'BED_RATE_UPDATE', entityType: 'beds', entityId: req.params.id,
+    amountPaise: ratePaise,
+    snapshot: { old_rate_paise: oldRate, new_rate_paise: ratePaise },
+    ip: req.ip,
+  });
+
+  return res.json(db.prepare('SELECT * FROM beds WHERE id = ?').get(req.params.id));
+}
+
+/**
+ * PATCH /api/v1/beds/bulk-rate
+ * Owner sets rate for multiple beds at once.
+ */
+function bulkUpdateBedRate(req, res) {
+  const db = getDb();
+  const propertyId = req.user.property_id;
+  const { bed_ids, base_rate_paise } = req.body;
+
+  if (!Array.isArray(bed_ids) || bed_ids.length === 0) {
+    return res.status(400).json({ error: 'bed_ids must be a non-empty array' });
+  }
+  if (base_rate_paise === undefined || base_rate_paise === null) {
+    return res.status(400).json({ error: 'base_rate_paise is required' });
+  }
+  const ratePaise = Math.round(parseFloat(base_rate_paise));
+  if (ratePaise < 0) return res.status(400).json({ error: 'base_rate_paise must be ≥ 0' });
+
+  const placeholders = bed_ids.map(() => '?').join(',');
+  const beds = db.prepare(
+    `SELECT id FROM beds WHERE id IN (${placeholders}) AND property_id = ?`
+  ).all(...bed_ids, propertyId);
+
+  if (beds.length === 0) return res.status(404).json({ error: 'No matching beds found' });
+
+  db.transaction(() => {
+    beds.forEach(b => {
+      db.prepare(`UPDATE beds SET base_rate_paise=?, updated_at=datetime('now') WHERE id=?`)
+        .run(ratePaise, b.id);
+    });
+  })();
+
+  writeAudit({
+    propertyId, userId: req.user.id,
+    action: 'BED_RATE_BULK_UPDATE', entityType: 'beds', entityId: beds.map(b => b.id).join(','),
+    amountPaise: ratePaise,
+    snapshot: { bed_count: beds.length, new_rate_paise: ratePaise },
+    ip: req.ip,
+  });
+
+  return res.json({ message: `Rate updated for ${beds.length} bed(s)`, updated: beds.length, base_rate_paise: ratePaise });
+}
+
 /** POST /api/v1/beds */
 function createBed(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
-  const { room_id, bed_label } = req.body;
+  const { room_id, bed_label, base_rate_paise = 0 } = req.body;
   if (!room_id || !bed_label) {
     return res.status(400).json({ error: 'room_id and bed_label are required' });
   }
   const room = db.prepare('SELECT * FROM rooms WHERE id = ? AND property_id = ?').get(room_id, propertyId);
   if (!room) return res.status(404).json({ error: 'Room not found' });
 
+  const ratePaise = Math.round(parseFloat(base_rate_paise) || 0);
   const id  = uuidv4();
   const now = new Date().toISOString();
   db.prepare(`
-    INSERT INTO beds (id, room_id, property_id, bed_label, status, created_at, updated_at)
-    VALUES (?, ?, ?, ?, 'available', ?, ?)
-  `).run(id, room_id, propertyId, bed_label.trim(), now, now);
+    INSERT INTO beds (id, room_id, property_id, bed_label, base_rate_paise, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, 'available', ?, ?)
+  `).run(id, room_id, propertyId, bed_label.trim(), ratePaise, now, now);
 
   return res.status(201).json(db.prepare('SELECT * FROM beds WHERE id = ?').get(id));
 }
@@ -113,4 +192,4 @@ function listFloors(req, res) {
   return res.json(result);
 }
 
-module.exports = { listBeds, getBed, updateBedStatus, createBed, listFloors };
+module.exports = { listBeds, getBed, updateBedStatus, updateBedRate, bulkUpdateBedRate, createBed, listFloors };
