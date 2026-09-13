@@ -55,7 +55,12 @@ function updateCatalogItem(req, res) {
   return res.json(db.prepare('SELECT * FROM addon_catalog WHERE id = ?').get(req.params.id));
 }
 
-/** POST /api/v1/residents/:id/addons */
+/**
+ * POST /api/v1/residents/:id/addons
+ *
+ * FIX: Accepts payment_mode from request body instead of hardcoding 'cash'.
+ * If tenant paid addon by UPI, the ledger now reflects that correctly.
+ */
 function addAddonCharge(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
@@ -63,7 +68,11 @@ function addAddonCharge(req, res) {
   const {
     catalog_item_id, name: customName, amount_paise,
     billing_mode = 'immediate', custom_reason, billing_month,
+    payment_mode = 'cash',
   } = req.body;
+
+  const VALID_MODES = ['cash', 'upi', 'card', 'bank_transfer'];
+  const mode = VALID_MODES.includes(payment_mode) ? payment_mode : 'cash';
 
   const resident = db.prepare(
     "SELECT * FROM residents WHERE id = ? AND property_id = ? AND status = 'active'"
@@ -99,14 +108,15 @@ function addAddonCharge(req, res) {
       billing_mode, isCustom, custom_reason || null,
       billing_month || now.substring(0, 7), req.user.id, now);
 
+    // FIX: Uses actual payment_mode from request, not hardcoded 'cash'
     if (billing_mode === 'immediate') {
       db.prepare(`
         INSERT INTO payment_ledger
           (id,property_id,resident_id,billing_month,amount_paise,direction,type,
            payment_mode,paid_at,requires_approval,approval_status,notes,recorded_by,created_at)
-        VALUES (?,?,?,?,?,'credit','extra_charge','cash',?,0,'not_required',?,?,?)
+        VALUES (?,?,?,?,?,'credit','extra_charge',?,?,0,'not_required',?,?,?)
       `).run(uuidv4(), propertyId, residentId,
-        billing_month || now.substring(0, 7), itemPrice, now,
+        billing_month || now.substring(0, 7), itemPrice, mode, now,
         `Add-on: ${itemName}`, req.user.id, now);
     }
   })();
@@ -115,7 +125,7 @@ function addAddonCharge(req, res) {
     propertyId, userId: req.user.id, action: 'ADDON_CHARGED',
     entityType: 'addon_charges', entityId: id,
     amountPaise: itemPrice,
-    snapshot: { name: itemName, billing_mode, resident_id: residentId },
+    snapshot: { name: itemName, billing_mode, payment_mode: mode, resident_id: residentId },
     ip: req.ip,
   });
 
