@@ -45,6 +45,8 @@ async function api(method, path, body) {
 
 function rupees(paise) { return `₹${(Math.round(paise || 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`; }
 function fmtDate(d) { return d ? new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '—'; }
+// FIX: Escape strings for safe use in onclick="fn('...')" attributes
+function esc(s) { return String(s || '').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;'); }
 
 // ── Toast ────────────────────────────────────────────────────
 function toast(msg, type = 'info', duration = 3500) {
@@ -111,6 +113,7 @@ const PAGES = {
     { id: 'feedback',  label: '⭐ Feedback' },
     { id: 'catalog',   label: '📦 Add-on Catalog' },
     { id: 'audit',     label: '🔍 Audit Log' },
+    { id: 'settings',  label: '⚙️ Settings' },
   ],
 };
 
@@ -140,7 +143,7 @@ function titleFor(page) {
   const map = { dashboard:'Dashboard', beds:'Beds', checkin:'Check In', residents:'Residents',
     payments:'Payments', addons:'Add-on Charges', bookings:'Bookings', reconcile:'Cash Reconciliation',
     expenses:'Expenses', reports:'Reports', staff:'Staff', feedback:'Tenant Feedback',
-    catalog:'Add-on Catalog', audit:'Audit Log' };
+    catalog:'Add-on Catalog', audit:'Audit Log', settings:'Property Settings' };
   return map[page] || page;
 }
 
@@ -266,6 +269,7 @@ async function renderPage(page) {
       case 'feedback':  await renderFeedback(el);  break;
       case 'catalog':   await renderCatalog(el);   break;
       case 'audit':     await renderAudit(el);     break;
+      case 'settings':  await renderSettings(el);  break;
       default:          el.innerHTML = '<div class="empty-state"><p>Page not found</p></div>';
     }
   } catch (ex) {
@@ -355,7 +359,7 @@ async function renderBeds(el) {
           <div class="bed-label">${b.bed_label}</div>
           <div class="bed-status">${b.room_number ? b.room_number+' · ' : ''}${b.status}</div>
           ${b.resident_name ? `<div class="bed-resident">${b.resident_name}</div>` : ''}
-          ${b.monthly_rent_paise ? `<div class="bed-resident">${rupees(b.monthly_rent_paise)}/mo</div>` : ''}
+          ${b.monthly_rent_paise ? `<div class="bed-resident">${rupees(b.monthly_rent_paise)}/mo</div>` : (b.base_rate_paise ? `<div class="bed-resident" style="opacity:.6">${rupees(b.base_rate_paise)}/mo</div>` : '')}
         </div>
       `).join('')}
     </div>
@@ -364,19 +368,28 @@ async function renderBeds(el) {
 
 async function showBedDetail(bedId) {
   const b = await api('GET', `/beds/${bedId}`);
+  const isOwnerMgr = ['owner','manager'].includes(STATE.user.role);
   openModal(`Bed: ${b.bed_label}`, `
     <div class="field-row">
       <div><div class="stat-label">Status</div><span class="badge badge-${b.status==='available'?'success':b.status==='occupied'?'info':'warning'}">${b.status}</span></div>
       <div><div class="stat-label">Room</div><p>${b.room_number||'—'} ${b.floor_label||''}</p></div>
     </div>
+    ${b.base_rate_paise ? `<div><div class="stat-label">Base Rate</div><p>${rupees(b.base_rate_paise)}/month</p></div>` : ''}
     ${b.resident_name ? `
       <hr class="divider"/>
       <div><strong>${b.resident_name}</strong> · ${b.resident_mobile||''}</div>
       <div class="text-muted">Check-in: ${fmtDate(b.check_in_date)} · Expected out: ${fmtDate(b.expected_checkout)}</div>
       <div>Rent: ${rupees(b.monthly_rent_paise)}/month</div>
       <div class="btn-group mt-12">
-        <button class="btn btn-outline btn-sm" onclick="closeModal();navigate('residents')">View Resident</button>
-        <button class="btn btn-danger btn-sm" onclick="closeModal();navigate('residents')">Check Out</button>
+        <button class="btn btn-outline btn-sm" onclick="closeModal();showResidentDetail('${b.resident_id}')">View Details</button>
+        <button class="btn btn-outline btn-sm" onclick="closeModal();showPaymentModal('${b.resident_id}','${esc(b.resident_name)}')">Record Payment</button>
+        <button class="btn btn-danger btn-sm" onclick="closeModal();showCheckoutModal('${b.resident_id}','${esc(b.resident_name)}',${b.deposit_paise||0})">Check Out</button>
+      </div>
+    ` : ''}
+    ${!b.resident_name && (b.status === 'available' || b.status === 'reserved') ? `
+      <hr class="divider"/>
+      <div class="btn-group">
+        <button class="btn btn-primary btn-sm" onclick="closeModal();navigateCheckinForBed('${b.id}')">✅ Check In to this bed</button>
       </div>
     ` : ''}
     ${!b.resident_name && b.status !== 'occupied' ? `
@@ -388,7 +401,33 @@ async function showBedDetail(bedId) {
         ).join('')}
       </div>
     ` : ''}
+    ${isOwnerMgr ? `
+      <hr class="divider"/>
+      <div class="section-title">Set Bed Rate</div>
+      <div class="field-row">
+        <div class="field"><label>Monthly Rate (paise)</label><input id="br-rate" type="number" min="0" value="${b.base_rate_paise||0}" /></div>
+        <div><button class="btn btn-outline btn-sm" style="margin-top:24px" onclick="saveBedRate('${bedId}')">Save Rate</button></div>
+      </div>
+    ` : ''}
   `);
+}
+
+function navigateCheckinForBed(bedId) {
+  navigate('checkin');
+  // Wait for the form to render, then pre-select the bed
+  setTimeout(() => {
+    const sel = document.getElementById('ci-bed');
+    if (sel) { sel.value = bedId; sel.dispatchEvent(new Event('change')); }
+  }, 300);
+}
+
+async function saveBedRate(bedId) {
+  try {
+    const rate = parseInt(document.getElementById('br-rate').value) || 0;
+    await api('PATCH', `/beds/${bedId}/rate`, { base_rate_paise: rate });
+    toast('Bed rate updated', 'success');
+    closeModal(); renderPage('beds');
+  } catch(ex) { toast(ex.message, 'error'); }
 }
 
 async function changeBedStatus(bedId, status) {
@@ -407,7 +446,10 @@ async function showAddBedModal() {
   )).join('');
   openModal('Add Bed', `
     <div class="field"><label>Room</label><select id="ab-room">${roomOptions}</select></div>
-    <div class="field"><label>Bed Label</label><input id="ab-label" placeholder="e.g. 101-D" /></div>
+    <div class="field-row">
+      <div class="field"><label>Bed Label *</label><input id="ab-label" placeholder="e.g. 101-D" /></div>
+      <div class="field"><label>Monthly Rate (paise)</label><input id="ab-rate" type="number" min="0" value="0" placeholder="500000" /></div>
+    </div>
     <div class="btn-group mt-12">
       <button class="btn btn-primary" onclick="submitAddBed()">Add Bed</button>
       <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
@@ -417,16 +459,25 @@ async function showAddBedModal() {
 
 async function submitAddBed() {
   try {
-    await api('POST', '/beds', { room_id: document.getElementById('ab-room').value, bed_label: document.getElementById('ab-label').value });
+    await api('POST', '/beds', {
+      room_id: document.getElementById('ab-room').value,
+      bed_label: document.getElementById('ab-label').value,
+      base_rate_paise: parseInt(document.getElementById('ab-rate').value) || 0,
+    });
     toast('Bed added', 'success'); closeModal(); renderPage('beds');
   } catch(ex) { toast(ex.message, 'error'); }
 }
 
 // ── Check In ─────────────────────────────────────────────────
 async function renderCheckin(el) {
-  const beds   = await api('GET', '/beds?status=available');
+  // FIX: Load both available AND reserved beds (reserved = confirmed booking ready for check-in)
+  const [avail, reserved] = await Promise.all([
+    api('GET', '/beds?status=available'),
+    api('GET', '/beds?status=reserved'),
+  ]);
+  const beds = [...avail, ...reserved];
   const bedOpts = beds.length
-    ? beds.map(b => `<option value="${b.id}">${b.bed_label} (${b.room_number||''})</option>`).join('')
+    ? beds.map(b => `<option value="${b.id}" data-rate="${b.base_rate_paise||0}">${b.bed_label} (${b.room_number||''})${b.status==='reserved'?' [RESERVED]':''}${b.base_rate_paise?` — ${rupees(b.base_rate_paise)}/mo`:''}</option>`).join('')
     : '<option value="">No available beds</option>';
 
   el.innerHTML = `
@@ -465,7 +516,7 @@ async function renderCheckin(el) {
         </div>
 
         <div class="section-title">Financial Details (in Paise)</div>
-        <div class="field-note mb-12">Enter amounts in paise (₹1 = 100 paise). Example: ₹5,000 = 500000</div>
+        <div class="field-note mb-12">Enter amounts in paise (₹1 = 100 paise). Example: ₹5,000 = 500000. Rent auto-fills from bed rate if set.</div>
         <div class="field-row">
           <div class="field"><label>Monthly Rent (paise) *</label><input id="ci-rent" type="number" min="0" required placeholder="500000" /></div>
           <div class="field"><label>Deposit (paise)</label><input id="ci-deposit" type="number" min="0" placeholder="1000000" /></div>
@@ -496,6 +547,18 @@ async function renderCheckin(el) {
       </form>
     </div>
   `;
+  // Auto-fill rent from bed base rate when bed selection changes
+  const bedSelect = document.getElementById('ci-bed');
+  const rentInput = document.getElementById('ci-rent');
+  if (bedSelect && rentInput) {
+    function fillRate() {
+      const opt = bedSelect.options[bedSelect.selectedIndex];
+      const rate = parseInt(opt?.dataset?.rate || 0);
+      if (rate > 0 && !rentInput.value) rentInput.value = rate;
+    }
+    bedSelect.addEventListener('change', () => { rentInput.value = ''; fillRate(); });
+    fillRate(); // fill on initial load
+  }
 }
 
 async function submitCheckin() {
@@ -572,7 +635,7 @@ async function renderResidents(el) {
                 <td><span class="badge badge-${r.payment_badge==='paid'?'success':r.payment_badge==='partial'?'warning':'danger'}">${r.payment_badge}</span></td>
                 <td>
                   <button class="btn btn-outline btn-sm" onclick="showResidentDetail('${r.id}')">View</button>
-                  ${r.status==='active' ? `<button class="btn btn-danger btn-sm" onclick="showCheckoutModal('${r.id}','${r.full_name}',${r.deposit_paise})">Check Out</button>` : ''}
+                  ${r.status==='active' ? `<button class="btn btn-danger btn-sm" onclick="showCheckoutModal('${r.id}','${esc(r.full_name)}',${r.deposit_paise})">Check Out</button>` : ''}
                 </td>
               </tr>
             `).join('')}
@@ -625,8 +688,8 @@ async function showResidentDetail(id) {
       </div>
     ` : '<p class="text-muted mt-12">No payment records</p>'}
     <div class="btn-group mt-12">
-      <button class="btn btn-outline btn-sm" onclick="closeModal();showPaymentModal('${r.id}','${r.full_name}')">Record Payment</button>
-      ${r.status==='active'?`<button class="btn btn-danger btn-sm" onclick="closeModal();showCheckoutModal('${r.id}','${r.full_name}',${r.deposit_paise})">Check Out</button>`:''}
+      <button class="btn btn-outline btn-sm" onclick="closeModal();showPaymentModal('${r.id}','${esc(r.full_name)}')">Record Payment</button>
+      ${r.status==='active'?`<button class="btn btn-danger btn-sm" onclick="closeModal();showCheckoutModal('${r.id}','${esc(r.full_name)}',${r.deposit_paise})">Check Out</button>`:''}
     </div>
   `, { wide: true });
 }
@@ -731,6 +794,49 @@ async function renderPayments(el) {
   `;
 }
 
+// FIX: showPaymentModal was called from resident detail but never defined
+function showPaymentModal(residentId, residentName) {
+  openModal(`Record Payment: ${residentName}`, `
+    <input type="hidden" id="pm-resident" value="${residentId}" />
+    <div class="field-row">
+      <div class="field"><label>Type</label>
+        <select id="pm-type"><option value="rent">Rent</option><option value="advance">Advance</option><option value="deposit">Deposit</option><option value="extra_charge">Extra Charge</option></select>
+      </div>
+      <div class="field"><label>Amount (paise) *</label><input id="pm-amount" type="number" min="1" placeholder="500000" /></div>
+    </div>
+    <div class="field-row">
+      <div class="field"><label>Payment Mode</label>
+        <select id="pm-mode"><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option><option value="bank_transfer">Bank Transfer</option></select>
+      </div>
+      <div class="field"><label>Billing Month</label><input id="pm-month" type="month" value="${new Date().toISOString().substring(0,7)}" /></div>
+    </div>
+    <div class="field"><label>Notes</label><input id="pm-notes" /></div>
+    <div id="pm-error" class="error-msg hidden"></div>
+    <div class="btn-group mt-12">
+      <button class="btn btn-primary" onclick="submitModalPayment()">💳 Record Payment</button>
+      <button class="btn btn-outline" onclick="closeModal()">Cancel</button>
+    </div>
+  `);
+}
+
+async function submitModalPayment() {
+  const err = document.getElementById('pm-error');
+  err.classList.add('hidden');
+  try {
+    await api('POST', '/payments', {
+      resident_id:   document.getElementById('pm-resident').value,
+      type:          document.getElementById('pm-type').value,
+      amount_paise:  parseInt(document.getElementById('pm-amount').value),
+      payment_mode:  document.getElementById('pm-mode').value,
+      billing_month: document.getElementById('pm-month').value,
+      notes:         document.getElementById('pm-notes').value,
+    });
+    toast('Payment recorded', 'success');
+    closeModal();
+    refreshCurrentPage();
+  } catch(ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
+}
+
 async function submitPayment() {
   const err = document.getElementById('pay-error');
   err.classList.add('hidden');
@@ -779,7 +885,12 @@ async function renderAddons(el) {
           <select id="ao-billing"><option value="immediate">Immediate</option><option value="monthly_bill">Next Bill</option></select>
         </div>
       </div>
-      <div class="field"><label>Reason</label><input id="ao-reason" /></div>
+      <div class="field-row">
+        <div class="field"><label>Payment Mode</label>
+          <select id="ao-mode"><option value="cash">Cash</option><option value="upi">UPI</option><option value="card">Card</option></select>
+        </div>
+        <div class="field"><label>Reason</label><input id="ao-reason" /></div>
+      </div>
       <div id="ao-error" class="error-msg hidden"></div>
       <button class="btn btn-primary mt-12" onclick="submitAddon()">Add Charge</button>
     </div>
@@ -796,6 +907,7 @@ async function submitAddon() {
       name:            document.getElementById('ao-name').value.trim() || undefined,
       amount_paise:    parseInt(document.getElementById('ao-amount').value),
       billing_mode:    document.getElementById('ao-billing').value,
+      payment_mode:    document.getElementById('ao-mode').value,
       custom_reason:   document.getElementById('ao-reason').value.trim(),
     });
     toast('Add-on charge recorded', 'success'); renderPage('addons');
@@ -939,13 +1051,14 @@ async function renderExpenses(el) {
       </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>Date</th><th>Category</th><th>Description</th><th>Amount</th><th>Mode</th></tr></thead>
+          <thead><tr><th>Date</th><th>Category</th><th>Description</th><th>Amount</th><th>Mode</th>${STATE.user.role==='owner'?'<th>Actions</th>':''}</tr></thead>
           <tbody>
             ${expenses.map(e => `
               <tr>
                 <td>${fmtDate(e.expense_date)}</td><td>${e.category}</td>
                 <td>${e.description||'—'}</td><td class="text-danger">${rupees(e.amount_paise)}</td>
                 <td>${e.payment_mode}</td>
+                ${STATE.user.role==='owner'?`<td><button class="btn btn-danger btn-sm" onclick="deleteExpense('${e.id}')">Delete</button></td>`:''}
               </tr>
             `).join('')}
           </tbody>
@@ -970,6 +1083,15 @@ async function submitExpense() {
   } catch(ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
 }
 
+async function deleteExpense(id) {
+  if (!confirm('Delete this expense? This cannot be undone.')) return;
+  try {
+    await api('DELETE', `/expenses/${id}`);
+    toast('Expense deleted', 'warning');
+    renderPage('expenses');
+  } catch(ex) { toast(ex.message, 'error'); }
+}
+
 // ── Reports ───────────────────────────────────────────────────
 async function renderReports(el) {
   const from = `${new Date().toISOString().substring(0,7)}-01`;
@@ -987,9 +1109,9 @@ async function renderReports(el) {
       <div class="card mb-20">
         <strong>Export Report</strong>
         <div class="btn-group mt-12">
-          <a href="/api/v1/reports/export?format=xlsx&from=${from}&to=${to}" class="btn btn-outline" target="_blank">📊 Excel</a>
-          <a href="/api/v1/reports/export?format=csv&from=${from}&to=${to}"  class="btn btn-outline" target="_blank">📄 CSV</a>
-          <a href="/api/v1/reports/export?format=pdf&from=${from}&to=${to}"  class="btn btn-outline" target="_blank">📋 PDF</a>
+          <button class="btn btn-outline" onclick="downloadReport('xlsx','${from}','${to}')">📊 Excel</button>
+          <button class="btn btn-outline" onclick="downloadReport('csv','${from}','${to}')">📄 CSV</button>
+          <button class="btn btn-outline" onclick="downloadReport('pdf','${from}','${to}')">📋 PDF</button>
         </div>
       </div>
     ` : ''}
@@ -1011,6 +1133,72 @@ async function renderReports(el) {
       </div>
     </div>
   `;
+}
+
+// FIX: Download export with auth token (bare <a> tags don't send Bearer token)
+async function downloadReport(format, from, to) {
+  try {
+    const res = await fetch(`/api/v1/reports/export?format=${format}&from=${from}&to=${to}`, {
+      headers: { Authorization: `Bearer ${STATE.token}` },
+    });
+    if (!res.ok) throw new Error('Export failed');
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `dormbook-report-${from}-to-${to}.${format}`;
+    a.click();
+    URL.revokeObjectURL(url);
+    toast('Report downloaded', 'success');
+  } catch(ex) { toast(ex.message, 'error'); }
+}
+
+// ── Property Settings (owner only) ────────────────────────────
+async function renderSettings(el) {
+  const prop = await api('GET', '/dashboard/summary').catch(() => null);
+  // Fetch current property data by using a lightweight call
+  let settings;
+  try {
+    // The settings are returned when we PATCH, but for reading we need the current values
+    // We'll fetch via a dummy patch that changes nothing, or show the form with current known values
+    settings = await api('PATCH', '/properties/settings', {});
+  } catch(ex) {
+    el.innerHTML = `<div class="error-msg">Could not load settings: ${ex.message}</div>`;
+    return;
+  }
+  el.innerHTML = `
+    <div class="card">
+      <strong>Property Settings</strong>
+      <div class="field mt-12"><label>Property Name</label><input id="ps-name" value="${settings.name||''}" /></div>
+      <div class="field"><label>WhatsApp Number (with country code)</label><input id="ps-wa" value="${settings.whatsapp_number||''}" placeholder="919999900001" /></div>
+      <div class="field-row">
+        <div class="field"><label>Cleaning Timeout (minutes)</label><input id="ps-clean" type="number" min="0" value="${settings.cleaning_timeout_minutes||120}" /></div>
+        <div class="field"><label>Refund Approval Threshold (paise)</label><input id="ps-refund" type="number" min="0" value="${settings.refund_approval_threshold_paise||0}" /></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Booking Lock (hours)</label><input id="ps-lock" type="number" min="1" value="${settings.booking_lock_hours||24}" /></div>
+        <div class="field"><label>Cash Tolerance (paise)</label><input id="ps-cash" type="number" min="0" value="${settings.cash_reconciliation_tolerance_paise||0}" /></div>
+      </div>
+      <div id="ps-error" class="error-msg hidden"></div>
+      <button class="btn btn-primary mt-12" onclick="submitSettings()">Save Settings</button>
+    </div>
+  `;
+}
+
+async function submitSettings() {
+  const err = document.getElementById('ps-error');
+  err.classList.add('hidden');
+  try {
+    await api('PATCH', '/properties/settings', {
+      name:                              document.getElementById('ps-name').value.trim() || undefined,
+      whatsapp_number:                   document.getElementById('ps-wa').value.trim() || undefined,
+      cleaning_timeout_minutes:          parseInt(document.getElementById('ps-clean').value),
+      refund_approval_threshold_paise:   parseInt(document.getElementById('ps-refund').value),
+      booking_lock_hours:                parseInt(document.getElementById('ps-lock').value),
+      cash_reconciliation_tolerance_paise: parseInt(document.getElementById('ps-cash').value),
+    });
+    toast('Settings saved', 'success');
+  } catch(ex) { err.textContent = ex.message; err.classList.remove('hidden'); }
 }
 
 // ── Staff ─────────────────────────────────────────────────────
