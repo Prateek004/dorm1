@@ -1,12 +1,14 @@
 /**
- * DormBook Service Worker — v2.0
+ * DormBook Service Worker — v2.1
  * Implements:
  *   - Cache-first for static assets
  *   - Network-first for API calls (with offline fallback)
  *   - Background Sync for offline payment/checkin mutations
+ *
+ * IMPORTANT: Bump CACHE_VERSION on every deploy that changes static files.
  */
 
-const CACHE_VERSION   = 'dormbook-v2';
+const CACHE_VERSION   = 'dormbook-v2.1';
 const STATIC_CACHE    = `${CACHE_VERSION}-static`;
 const API_CACHE       = `${CACHE_VERSION}-api`;
 const SYNC_QUEUE_KEY  = 'dormbook-sync-queue';
