@@ -32,7 +32,7 @@ function getBed(req, res) {
   const bed = db.prepare(`
     SELECT b.*, rm.room_number, f.label as floor_label,
            r.id as resident_id, r.full_name as resident_name, r.mobile as resident_mobile,
-           r.monthly_rent_paise, r.check_in_date, r.expected_checkout
+           r.monthly_rent_paise, r.deposit_paise, r.check_in_date, r.expected_checkout
     FROM beds b
     LEFT JOIN rooms rm ON rm.id = b.room_id
     LEFT JOIN floors f ON f.id = rm.floor_id
