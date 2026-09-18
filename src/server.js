@@ -9,11 +9,11 @@ const morgan    = require('morgan');
 const rateLimit = require('express-rate-limit');
 const path      = require('path');
 
-const { initDb }         = require('./db/init');
-const { setDb }          = require('./db/connection');
+const { initDb }          = require('./db/init');
+const { setDb }           = require('./db/connection');
 const { autoSeedIfEmpty } = require('./db/seed');
-const routes             = require('./routes/index');
-const { startScheduler } = require('./services/scheduler');
+const routes              = require('./routes/index');
+const { startScheduler }  = require('./services/scheduler');
 
 function validateEnv() {
   const errors = [];
@@ -51,11 +51,12 @@ app.set('trust proxy', 1);
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc:  ["'self'", "'unsafe-inline'"],
-      styleSrc:   ["'self'", "'unsafe-inline'"],
-      imgSrc:     ["'self'", 'data:', 'blob:'],
-      connectSrc: ["'self'"],
+      defaultSrc:    ["'self'"],
+      scriptSrc:     ["'self'", "'unsafe-inline'"],
+      scriptSrcAttr: ["'unsafe-inline'"],
+      styleSrc:      ["'self'", "'unsafe-inline'"],
+      imgSrc:        ["'self'", 'data:', 'blob:'],
+      connectSrc:    ["'self'"],
     },
   },
 }));
