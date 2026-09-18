@@ -39,31 +39,10 @@ function logDocumentAccess(db, { residentId, accessedBy, documentType, ip }) {
   `).run(uuidv4(), residentId, accessedBy, documentType, ip || null);
 }
 
-/**
- * Express middleware factory — auto-logs route outcomes.
- */
-function auditMiddleware(action, entityType) {
-  return (req, res, next) => {
-    const originalJson = res.json.bind(res);
-    res.json = function (data) {
-      if (res.statusCode < 400 && req.user) {
-        const entityId = data?.id || data?.residentId || data?.bedId || 'unknown';
-        try {
-          writeAudit({
-            propertyId:  req.user.property_id,
-            userId:      req.user.id,
-            action,
-            entityType,
-            entityId:    String(entityId),
-            snapshot:    data,
-            ip:          req.ip,
-          });
-        } catch { /* non-fatal */ }
-      }
-      return originalJson(data);
-    };
-    next();
-  };
-}
+// FIX L-03: Removed auditMiddleware — it was exported but never registered
+// on any route in the codebase, making it dead code. Keeping it would invite
+// future confusion ("is this actually used?") and increases the module's
+// surface area for no benefit. writeAudit() and logDocumentAccess() are the
+// only audit paths in use and are called explicitly from controllers.
 
-module.exports = { writeAudit, logDocumentAccess, auditMiddleware };
+module.exports = { writeAudit, logDocumentAccess };
