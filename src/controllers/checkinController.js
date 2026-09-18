@@ -25,14 +25,16 @@ function ensureColumns(db) {
 }
 
 /**
- * POST /api/v1/residents — Simplified check-in
+ * POST /api/v1/residents — Check-in a new resident
  *
- * Mandatory: full_name, mobile, bed_id, check_in_date, expected_checkout, aadhaar_consent
- * Rate: auto-fills from bed.daily_rate_paise, staff picks rate_type (daily/weekly/monthly)
+ * FIX H-01: Bed availability is now enforced atomically inside the transaction.
+ * We attempt UPDATE beds SET status='occupied' WHERE id=? AND status IN ('available','reserved')
+ * and check changes. If 0, the bed was taken between our validation read and the write — return 409.
+ * This eliminates the TOCTOU race that allowed double-booking under concurrent requests.
  */
 function checkIn(req, res) {
   const db = getDb();
-  ensureColumns(db); // ensure rate_type + rate_paise columns exist
+  ensureColumns(db);
   const propertyId = req.user.property_id;
 
   const {
@@ -63,9 +65,11 @@ function checkIn(req, res) {
   const RATE_TYPES = ['daily', 'weekly', 'monthly'];
   if (!RATE_TYPES.includes(rate_type)) return res.status(400).json({ error: `rate_type must be: ${RATE_TYPES.join(', ')}` });
 
-  // Bed check
+  // Pre-flight read: verify bed exists and belongs to this property.
+  // Status check is NOT authoritative here — the atomic UPDATE inside the transaction is.
   const bed = db.prepare('SELECT * FROM beds WHERE id = ? AND property_id = ?').get(bed_id, propertyId);
   if (!bed) return res.status(404).json({ error: 'Bed not found' });
+  // Early rejection for obviously wrong states (saves transaction overhead for clearly occupied beds)
   if (bed.status !== 'available' && bed.status !== 'reserved') {
     return res.status(409).json({ error: `Bed is '${bed.status}' — only available or reserved beds` });
   }
@@ -94,7 +98,19 @@ function checkIn(req, res) {
   const residentId = uuidv4();
   const billingMonth = check_in_date.substring(0, 7);
 
+  // FIX H-01: Atomic bed claim inside transaction.
+  // UPDATE returns changes=0 if bed was already taken by a concurrent request.
+  let raceDetected = false;
   db.transaction(() => {
+    const { changes } = db.prepare(
+      "UPDATE beds SET status='occupied', cleaning_started_at=NULL, booking_request_id=NULL, updated_at=datetime('now') WHERE id=? AND property_id=? AND status IN ('available','reserved')"
+    ).run(bed_id, propertyId);
+
+    if (changes === 0) {
+      raceDetected = true;
+      return;
+    }
+
     db.prepare(`
       INSERT INTO residents
         (id, property_id, bed_id, full_name, mobile,
@@ -105,7 +121,7 @@ function checkIn(req, res) {
          photo_path, check_in_date, expected_checkout, rent_due_day,
          monthly_rent_paise, rate_type, rate_paise, deposit_paise, status,
          notes, checkin_by, created_at, updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,  'active',?,?,?,?)
+      VALUES (?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?)
     `).run(
       residentId, propertyId, bed_id, full_name.trim(), mobileClean,
       aadhaarEncrypted, aadhaarLast4, aadhaar_mobile || null, aadhaar_photo_path || null,
@@ -137,14 +153,15 @@ function checkIn(req, res) {
         payment_mode || 'cash', gateway_txn_id || null, now, 'Advance on check-in', req.user.id, now);
     }
 
-    db.prepare(`UPDATE beds SET status='occupied', cleaning_started_at=NULL, booking_request_id=NULL, updated_at=datetime('now') WHERE id=?`)
-      .run(bed_id);
-
     if (bed.status === 'reserved' && bed.booking_request_id) {
       db.prepare(`UPDATE booking_requests SET status='confirmed', converted_to_resident_id=? WHERE id=? AND status IN ('pending','confirmed')`)
         .run(residentId, bed.booking_request_id);
     }
   })();
+
+  if (raceDetected) {
+    return res.status(409).json({ error: 'Bed is no longer available — it was just taken' });
+  }
 
   writeAudit({ propertyId, userId: req.user.id, action: 'CHECKIN',
     entityType: 'resident', entityId: residentId,
@@ -225,7 +242,14 @@ function getResident(req, res) {
   return res.json({ ...resident, payments });
 }
 
-/** POST /api/v1/residents/:id/checkout */
+/**
+ * POST /api/v1/residents/:id/checkout
+ *
+ * FIX H-02: Resident status is now claimed atomically inside the transaction.
+ * We UPDATE residents SET status='pending_checkout' WHERE id=? AND status='active'
+ * and check changes. If 0, another request already claimed the checkout — return 409.
+ * This eliminates the TOCTOU race that allowed duplicate payment_ledger rows.
+ */
 function checkOut(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
@@ -238,6 +262,7 @@ function checkOut(req, res) {
   const resident = db.prepare('SELECT * FROM residents WHERE id = ? AND property_id = ?').get(residentId, propertyId);
   if (!resident) return res.status(404).json({ error: 'Resident not found' });
   if (resident.status === 'checked_out') return res.status(409).json({ error: 'Already checked out' });
+  if (resident.status === 'pending_checkout') return res.status(409).json({ error: 'Checkout already in progress' });
 
   const now = new Date().toISOString();
   const refundPaise = Math.round(parseFloat(deposit_refund_paise) || 0);
@@ -247,8 +272,19 @@ function checkOut(req, res) {
   const threshold = prop?.refund_approval_threshold_paise ?? 0;
   const needsApproval = refundPaise > threshold;
   let refundPaymentId = null;
+  let raceDetected = false;
 
   db.transaction(() => {
+    // FIX H-02: Atomic status claim. If changes=0, another concurrent checkout won the race.
+    const { changes } = db.prepare(
+      "UPDATE residents SET status='pending_checkout', updated_at=datetime('now') WHERE id=? AND property_id=? AND status='active'"
+    ).run(residentId, propertyId);
+
+    if (changes === 0) {
+      raceDetected = true;
+      return;
+    }
+
     if (extraPaise > 0) {
       db.prepare(`INSERT INTO payment_ledger (id,property_id,resident_id,billing_month,amount_paise,direction,type,payment_mode,paid_at,requires_approval,approval_status,notes,recorded_by,created_at)
         VALUES (?,?,?,?,?,'credit','extra_charge',?,?,0,'not_required',?,?,?)`)
@@ -266,6 +302,10 @@ function checkOut(req, res) {
     }
   })();
 
+  if (raceDetected) {
+    return res.status(409).json({ error: 'Checkout already in progress for this resident' });
+  }
+
   writeAudit({ propertyId, userId: req.user.id, action: 'CHECKOUT_INITIATED',
     entityType: 'resident', entityId: residentId, amountPaise: refundPaise,
     snapshot: { checkout_date, extra: extraPaise, refund: refundPaise, needs_approval: needsApproval }, ip: req.ip });
@@ -275,7 +315,11 @@ function checkOut(req, res) {
     refund_pending_approval: needsApproval, refund_payment_id: refundPaymentId });
 }
 
-/** POST /api/v1/residents/:id/checkout/approve */
+/**
+ * POST /api/v1/residents/:id/checkout/approve
+ *
+ * FIX L-01: Removed datetime('now','localtime') — all timestamps use UTC.
+ */
 function approveCheckout(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
@@ -293,8 +337,12 @@ function approveCheckout(req, res) {
     db.prepare(`UPDATE payment_ledger SET approval_status=?, approved_by=?, approved_at=?, notes=COALESCE(?,notes) WHERE id=?`)
       .run(decision, req.user.id, now, notes||null, refund.id);
     if (decision === 'approved') {
-      db.prepare(`UPDATE residents SET status='checked_out', actual_checkout=datetime('now','localtime'), updated_at=datetime('now') WHERE id=?`).run(residentId);
+      // FIX L-01: Use datetime('now') — UTC only, consistent with all other timestamps.
+      db.prepare(`UPDATE residents SET status='checked_out', actual_checkout=datetime('now'), updated_at=datetime('now') WHERE id=?`).run(residentId);
       if (resident.bed_id) db.prepare(`UPDATE beds SET status='cleaning', cleaning_started_at=datetime('now'), updated_at=datetime('now') WHERE id=?`).run(resident.bed_id);
+    } else {
+      // Rejected: revert resident back to active so checkout can be re-attempted
+      db.prepare(`UPDATE residents SET status='active', updated_at=datetime('now') WHERE id=?`).run(residentId);
     }
   })();
   writeAudit({ propertyId, userId: req.user.id, action: decision==='approved'?'CHECKOUT_APPROVED':'CHECKOUT_REJECTED',
@@ -332,7 +380,7 @@ function extendStay(req, res) {
   return res.json({ message: 'Stay extended', resident: updated });
 }
 
-/** PATCH /api/v1/residents/:id/rent — change rate without extending */
+/** PATCH /api/v1/residents/:id/rent */
 function updateResidentRent(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
