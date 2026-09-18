@@ -107,14 +107,34 @@ router.get ('/receipts/:receipt_number/pdf',     authenticate, sameProperty, rec
 // ── Cron endpoints ────────────────────────────────────────
 router.post('/cron/release-expired-bookings', verifyCronSecret, bookings.releaseExpired);
 
+// FIX C-01 + C-02: Fail-closed guards.
+// Previously used `if (secret && ...)` which fails open when the env var is unset.
+// Now: if secret is not configured, deny ALL requests to these endpoints.
 function verifyCronSecret(req, res, next) {
   const secret = process.env.CRON_SECRET;
-  if (secret && req.headers['x-cron-secret'] !== secret) return res.status(401).json({ error: 'Invalid cron secret' });
+  if (!secret) {
+    if (process.env.NODE_ENV !== 'test') {
+      console.warn('[SECURITY] CRON_SECRET not set — cron endpoint is disabled until configured');
+    }
+    return res.status(401).json({ error: 'Cron endpoint requires CRON_SECRET to be configured' });
+  }
+  if (req.headers['x-cron-secret'] !== secret) {
+    return res.status(401).json({ error: 'Invalid cron secret' });
+  }
   next();
 }
+
 function verifyWebhookSecret(req, res, next) {
   const secret = process.env.WEBHOOK_SECRET;
-  if (secret && req.headers['x-webhook-secret'] !== secret) return res.status(401).json({ error: 'Invalid webhook secret' });
+  if (!secret) {
+    if (process.env.NODE_ENV !== 'test') {
+      console.warn('[SECURITY] WEBHOOK_SECRET not set — webhook endpoint is disabled until configured');
+    }
+    return res.status(401).json({ error: 'Webhook endpoint requires WEBHOOK_SECRET to be configured' });
+  }
+  if (req.headers['x-webhook-secret'] !== secret) {
+    return res.status(401).json({ error: 'Invalid webhook secret' });
+  }
   next();
 }
 
