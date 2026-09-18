@@ -58,18 +58,27 @@ function getBed(req, res) {
   return res.json(bed);
 }
 
-/** PATCH /api/v1/beds/:id/status */
+/**
+ * PATCH /api/v1/beds/:id/status
+ *
+ * FIX L-02: 'occupied' is no longer an allowed target status through this endpoint.
+ * The 'occupied' status is exclusively managed by checkIn(). Allowing manual setting
+ * of 'occupied' with no resident attached corrupts occupancy data and capacity reporting.
+ * If a bed is mis-tagged as occupied (e.g., after a data migration issue), an owner
+ * should set it to 'available' or 'cleaning' to recover it.
+ */
 function updateBedStatus(req, res) {
   const db = getDb();
   const { status, notes } = req.body;
-  const VALID = ['available', 'cleaning', 'occupied', 'reserved', 'pending'];
+  // FIX L-02: 'occupied' removed from valid manual transitions
+  const VALID = ['available', 'cleaning', 'reserved', 'pending'];
   if (!VALID.includes(status)) {
-    return res.status(400).json({ error: `status must be one of: ${VALID.join(', ')}` });
+    return res.status(400).json({ error: `status must be one of: ${VALID.join(', ')} — 'occupied' is set automatically on check-in` });
   }
   const bed = db.prepare('SELECT * FROM beds WHERE id = ? AND property_id = ?')
     .get(req.params.id, req.user.property_id);
   if (!bed) return res.status(404).json({ error: 'Bed not found' });
-  if (bed.status === 'occupied' && status !== 'occupied') {
+  if (bed.status === 'occupied') {
     const hasActive = db.prepare(
       "SELECT COUNT(*) as c FROM residents WHERE bed_id = ? AND status = 'active'"
     ).get(req.params.id);
