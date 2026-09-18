@@ -3,7 +3,6 @@
 const { v4: uuidv4 } = require('uuid');
 const { getDb }       = require('../db/connection');
 const { writeAudit }  = require('../middleware/auditLog');
-const { scheduleWhatsApp } = require('../services/whatsappService');
 
 /** POST /api/v1/bookings — lock a bed for up to BOOKING_LOCK_HOURS */
 function createBooking(req, res) {
@@ -80,7 +79,6 @@ function confirmBooking(req, res) {
   if (!booking) return res.status(404).json({ error: 'Pending booking not found' });
 
   if (new Date(booking.lock_expires_at) < new Date()) {
-    // Auto-expire
     db.prepare("UPDATE booking_requests SET status='expired' WHERE id=?").run(req.params.id);
     db.prepare("UPDATE beds SET status='available', booking_request_id=NULL, updated_at=datetime('now') WHERE id=?")
       .run(booking.bed_id);
@@ -119,11 +117,20 @@ function cancelBooking(req, res) {
   return res.json({ message: 'Booking cancelled, bed released' });
 }
 
-/** POST /api/v1/bookings/release-expired — called by cron */
+/**
+ * POST /api/v1/bookings/release-expired — called by cron or manager
+ *
+ * FIX M-02: Previously only released bookings with status='pending'.
+ * A booking moves to status='confirmed' after confirmBooking() is called,
+ * but the bed stays 'reserved'. If the prospect never checks in and the
+ * lock_expires_at passes, the bed would be stuck as 'reserved' forever.
+ * Fix: include status='confirmed' in the expiry query.
+ */
 function releaseExpired(req, res) {
   const db = getDb();
   const expired = db.prepare(`
-    SELECT * FROM booking_requests WHERE status = 'pending' AND lock_expires_at < datetime('now')
+    SELECT * FROM booking_requests
+    WHERE status IN ('pending', 'confirmed') AND lock_expires_at < datetime('now')
   `).all();
 
   let released = 0;
