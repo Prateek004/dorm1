@@ -7,6 +7,12 @@ const { getDb } = require('../db/connection');
 /**
  * Generate a receipt number: DB-[PROP_CODE]-[YYYYMM]-[SEQ]
  * e.g. DB-PRIYA-202601-0042
+ *
+ * FIX H-03: This function is now ONLY called from within generateReceipt,
+ * which wraps the entire read+insert in a db.transaction(). That transaction
+ * serializes all receipt number reads and inserts, eliminating the race
+ * condition where two concurrent calls could read the same last receipt
+ * number and compute the same next sequence, causing a UNIQUE violation.
  */
 function generateReceiptNumber(db, propertyId, billingMonth) {
   const prop = db.prepare('SELECT property_code FROM properties WHERE id = ?').get(propertyId);
@@ -31,6 +37,12 @@ function generateReceiptNumber(db, propertyId, billingMonth) {
 /**
  * Create a receipt record for a payment ledger entry.
  * Returns the created receipt object or null if already exists.
+ *
+ * FIX H-03: The receipt number generation (read) and insertion are wrapped
+ * in a single synchronous db.transaction(). better-sqlite3 transactions
+ * are exclusive for writes, so concurrent calls serialize correctly.
+ * No two calls can read the same "last" receipt number and compute the same
+ * next sequence — the second call will see the first call's insert.
  */
 async function generateReceipt({ db: passedDb, paymentId, propertyId, residentId, actorId }) {
   const db = passedDb || getDb();
@@ -42,7 +54,6 @@ async function generateReceipt({ db: passedDb, paymentId, propertyId, residentId
   if (!payment) return null;
 
   const resident = db.prepare('SELECT full_name, mobile FROM residents WHERE id = ?').get(residentId);
-  const receiptNumber = generateReceiptNumber(db, propertyId, payment.billing_month);
 
   const lineItems = [
     {
@@ -53,15 +64,33 @@ async function generateReceipt({ db: passedDb, paymentId, propertyId, residentId
 
   const id  = uuidv4();
   const now = new Date().toISOString();
-  db.prepare(`
-    INSERT INTO receipts
-      (id, property_id, resident_id, payment_ledger_id, receipt_number,
-       amount_paise, line_items, wa_delivered, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
-  `).run(id, propertyId, residentId, paymentId, receiptNumber,
-    payment.amount_paise, JSON.stringify(lineItems), now);
 
-  return db.prepare('SELECT * FROM receipts WHERE id = ?').get(id);
+  // FIX H-03: Wrap the receipt number read + INSERT in a transaction.
+  // This serializes all receipt operations for this property/month,
+  // preventing duplicate sequence numbers under concurrent load.
+  let created = null;
+  db.transaction(() => {
+    // Re-check inside transaction — guard against duplicate receipt after acquiring write lock
+    const doubleCheck = db.prepare('SELECT * FROM receipts WHERE payment_ledger_id = ?').get(paymentId);
+    if (doubleCheck) {
+      created = doubleCheck;
+      return;
+    }
+
+    const receiptNumber = generateReceiptNumber(db, propertyId, payment.billing_month);
+
+    db.prepare(`
+      INSERT INTO receipts
+        (id, property_id, resident_id, payment_ledger_id, receipt_number,
+         amount_paise, line_items, wa_delivered, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+    `).run(id, propertyId, residentId, paymentId, receiptNumber,
+      payment.amount_paise, JSON.stringify(lineItems), now);
+
+    created = db.prepare('SELECT * FROM receipts WHERE id = ?').get(id);
+  })();
+
+  return created;
 }
 
 /**
