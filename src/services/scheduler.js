@@ -165,10 +165,16 @@ function revertCleanedBeds() {
 }
 
 // ── Booking Expiry ──────────────────────────────────────────────────────────
+/**
+ * FIX M-02 (scheduler): Include status='confirmed' bookings in expiry query.
+ * bookingsController.confirmBooking() sets status='confirmed' but bed remains 'reserved'.
+ * If the prospect never checks in and lock_expires_at passes, the bed would be stuck
+ * as 'reserved' forever. The same fix was applied to bookingsController.releaseExpired().
+ */
 function releaseExpiredBookings() {
   const db = getDb();
   const expired = db.prepare(
-    "SELECT * FROM booking_requests WHERE status='pending' AND lock_expires_at < datetime('now')"
+    "SELECT * FROM booking_requests WHERE status IN ('pending', 'confirmed') AND lock_expires_at < datetime('now')"
   ).all();
 
   if (!expired.length) return;
@@ -201,7 +207,6 @@ function sendOverstayAlerts() {
   overstayers.forEach(r => {
     const days = Math.floor((new Date(today) - new Date(r.expected_checkout)) / 86400000);
     console.warn(`[SCHEDULER] Overstay: ${r.full_name} (${days} days past checkout ${r.expected_checkout})`);
-    // Alert owner with distinct event type
     scheduleWhatsApp({
       propertyId: r.property_id, residentId: r.id,
       recipientMobile: '', recipientType: 'owner',
