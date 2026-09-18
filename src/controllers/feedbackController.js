@@ -3,10 +3,17 @@
 const { v4: uuidv4 } = require('uuid');
 const { getDb }      = require('../db/connection');
 
-/** POST /api/v1/feedback/rate — called by WhatsApp webhook */
+/**
+ * POST /api/v1/feedback/rate — called by WhatsApp webhook
+ *
+ * FIX (Security — IDOR): Previously accepted property_id from req.body and used it
+ * to attribute the feedback. An attacker knowing any resident_id could inject feedback
+ * for any property. Fix: property_id is ALWAYS derived from the resident record in DB.
+ * Client-supplied property_id is ignored entirely.
+ */
 function rateFeedback(req, res) {
   const db = getDb();
-  const { resident_id, invoice_id, rating, property_id } = req.body;
+  const { resident_id, invoice_id, rating } = req.body;
 
   const VALID_RATINGS = ['good', 'average', 'needs_help'];
   if (!resident_id || !invoice_id || !rating) {
@@ -20,10 +27,10 @@ function rateFeedback(req, res) {
   const existing = db.prepare('SELECT id FROM tenant_feedback WHERE invoice_id = ?').get(invoice_id);
   if (existing) return res.status(409).json({ error: 'Feedback already recorded for this invoice', id: existing.id });
 
-  const propertyId = property_id || (
-    db.prepare('SELECT property_id FROM residents WHERE id = ?').get(resident_id)?.property_id
-  );
-  if (!propertyId) return res.status(400).json({ error: 'Cannot determine property_id' });
+  // FIX: Always derive property_id from DB. Never trust client body.
+  const residentRow = db.prepare('SELECT id, property_id FROM residents WHERE id = ?').get(resident_id);
+  if (!residentRow) return res.status(404).json({ error: 'Resident not found' });
+  const propertyId = residentRow.property_id;
 
   const id  = uuidv4();
   const now = new Date().toISOString();
