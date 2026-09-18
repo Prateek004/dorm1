@@ -82,9 +82,7 @@ function recordPayment(req, res) {
   return res.status(201).json({ message: 'Payment recorded', payment });
 }
 
-/**
- * GET /api/v1/residents/:id/ledger
- */
+/** GET /api/v1/residents/:id/ledger */
 function getResidentLedger(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
@@ -116,9 +114,7 @@ function getResidentLedger(req, res) {
   });
 }
 
-/**
- * GET /api/v1/payments/pending-approvals
- */
+/** GET /api/v1/payments/pending-approvals */
 function pendingApprovals(req, res) {
   const db = getDb();
   const list = db.prepare(`
@@ -131,9 +127,7 @@ function pendingApprovals(req, res) {
   return res.json(list);
 }
 
-/**
- * POST /api/v1/payments/:id/approve
- */
+/** POST /api/v1/payments/:id/approve */
 function approvePayment(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
@@ -167,9 +161,7 @@ function approvePayment(req, res) {
   return res.json({ message: `Payment ${decision}`, decision });
 }
 
-/**
- * POST /api/v1/residents/:id/refund-deductions
- */
+/** POST /api/v1/residents/:id/refund-deductions */
 function addRefundDeduction(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
@@ -196,6 +188,14 @@ function addRefundDeduction(req, res) {
 
 /**
  * GET /api/v1/residents/:id/refund-summary
+ *
+ * FIX M-01: Previously computed dues as:
+ *   max(0, monthly_rent_paise - SUM(all rent payments ever))
+ * This made long-term residents show zero dues even if behind on current month.
+ *
+ * Fix: Compute outstanding dues per billing month across the resident's entire stay.
+ * For each month from check_in to today, sum rent+advance credits. If any month
+ * has credits < monthly_rent_paise, the shortfall is a blocking due.
  */
 function getRefundSummary(req, res) {
   const db = getDb();
@@ -215,27 +215,58 @@ function getRefundSummary(req, res) {
     "SELECT COALESCE(SUM(amount_paise),0) as total FROM payment_ledger WHERE resident_id = ? AND type = 'extra_charge' AND direction = 'credit'"
   ).get(residentId);
 
-  const pendingRent = db.prepare(`
-    SELECT COALESCE(SUM(pl.amount_paise),0) as total FROM payment_ledger pl
-    WHERE pl.resident_id = ? AND pl.type = 'rent' AND pl.approval_status != 'rejected'
-    AND pl.direction = 'credit'
-  `).get(residentId);
+  // FIX M-01: Per-month outstanding dues calculation.
+  const checkInMonth = resident.check_in_date ? resident.check_in_date.substring(0, 7) : null;
+  const today = new Date().toISOString().substring(0, 10);
+  const currentMonth = today.substring(0, 7);
+
+  let totalDuesPaise = 0;
+
+  if (checkInMonth && resident.monthly_rent_paise > 0) {
+    const endMonth = resident.actual_checkout
+      ? resident.actual_checkout.substring(0, 7)
+      : currentMonth;
+
+    const months = [];
+    let cursor = new Date(`${checkInMonth}-01`);
+    const end  = new Date(`${endMonth}-01`);
+    while (cursor <= end) {
+      months.push(cursor.toISOString().substring(0, 7));
+      cursor.setMonth(cursor.getMonth() + 1);
+    }
+
+    const paidByMonth = db.prepare(`
+      SELECT billing_month, COALESCE(SUM(amount_paise), 0) as paid
+      FROM payment_ledger
+      WHERE resident_id = ? AND type IN ('rent', 'advance')
+        AND direction = 'credit' AND approval_status != 'rejected'
+      GROUP BY billing_month
+    `).all(residentId).reduce((acc, row) => {
+      acc[row.billing_month] = row.paid;
+      return acc;
+    }, {});
+
+    for (const month of months) {
+      const paid = paidByMonth[month] || 0;
+      const shortfall = resident.monthly_rent_paise - paid;
+      if (shortfall > 0) totalDuesPaise += shortfall;
+    }
+  }
 
   const depositPaid = resident.deposit_paise;
   const totalDeductions = deductions.reduce((s, d) => s + d.amount_paise, 0)
     + (extraCharges.total || 0);
 
-  const dues = Math.max(0, (resident.monthly_rent_paise || 0) - (pendingRent.total || 0));
-  const netRefund = Math.max(0, depositPaid - totalDeductions - dues);
-  const isBlocked = (depositPaid - totalDeductions - dues) < 0;
+  const netRefund = Math.max(0, depositPaid - totalDeductions - totalDuesPaise);
+  const isBlocked = (depositPaid - totalDeductions - totalDuesPaise) < 0;
 
   return res.json({
-    deposit_paise:      depositPaid,
+    deposit_paise:          depositPaid,
     total_deductions_paise: totalDeductions,
-    pending_dues_paise: dues,
-    net_refund_paise:   netRefund,
-    is_blocked:         isBlocked,
-    block_reason:       isBlocked ? 'Dues exceed deposit amount — resident must clear balance before checkout' : null,
+    pending_dues_paise:     totalDuesPaise,
+    net_refund_paise:       netRefund,
+    is_blocked:             isBlocked,
+    block_reason:           isBlocked ? 'Dues exceed deposit amount — resident must clear balance before checkout' : null,
     deductions,
   });
 }
