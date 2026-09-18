@@ -1,59 +1,27 @@
 'use strict';
 
-require('dotenv').config();
+const path    = require('path');
+const express = require('express');
+const helmet  = require('helmet');
+const cors    = require('cors');
+const morgan  = require('morgan');
 
-const express   = require('express');
-const helmet    = require('helmet');
-const cors      = require('cors');
-const morgan    = require('morgan');
-const rateLimit = require('express-rate-limit');
-const path      = require('path');
-
-const { initDb }          = require('./db/init');
-const { setDb }           = require('./db/connection');
-const { autoSeedIfEmpty } = require('./db/seed');
-const routes              = require('./routes/index');
-const { startScheduler }  = require('./services/scheduler');
-
-function validateEnv() {
-  const errors = [];
-  if (!process.env.JWT_SECRET || process.env.JWT_SECRET.startsWith('CHANGE_ME')) {
-    if (process.env.NODE_ENV === 'production') {
-      errors.push('JWT_SECRET is not set. Run: openssl rand -base64 48');
-    } else {
-      console.warn('[ENV] WARNING: JWT_SECRET not set — using dev fallback');
-    }
-  }
-  if (!process.env.AES_256_KEY || process.env.AES_256_KEY.startsWith('CHANGE_ME')) {
-    if (process.env.NODE_ENV === 'production') {
-      errors.push('AES_256_KEY is not set. Run: openssl rand -hex 32');
-    } else {
-      console.warn('[ENV] WARNING: AES_256_KEY not set — using dev fallback (NEVER use in production)');
-    }
-  }
-  if (errors.length) {
-    console.error('[FATAL] Missing required environment variables:');
-    errors.forEach(e => console.error('  -', e));
-    process.exit(1);
-  }
-}
-validateEnv();
-
-const db = initDb();
-setDb(db);
-autoSeedIfEmpty(db);
+const { initDb }    = require('./db/connection');
+const { runMigrations } = require('./db/migrations');
+const routes        = require('./routes');
+const { startScheduler } = require('./scheduler');
 
 const app  = express();
-const PORT = parseInt(process.env.PORT || '3000', 10);
+const PORT = process.env.PORT || 8080;
+const ENV  = process.env.NODE_ENV || 'development';
 
-app.set('trust proxy', 1);
-
+// ── Security headers ──────────────────────────────────────────────────────────
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc:    ["'self'"],
       scriptSrc:     ["'self'", "'unsafe-inline'"],
-      scriptSrcAttr: ["'unsafe-inline'"],
+      scriptSrcAttr: ["'unsafe-inline'"],          // ← FIX: allow onclick= in innerHTML
       styleSrc:      ["'self'", "'unsafe-inline'"],
       imgSrc:        ["'self'", 'data:', 'blob:'],
       connectSrc:    ["'self'"],
@@ -61,80 +29,40 @@ app.use(helmet({
   },
 }));
 
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '')
-  .split(',').map(o => o.trim()).filter(Boolean);
+// ── General middleware ────────────────────────────────────────────────────────
+app.use(cors());
+app.use(express.json({ limit: '2mb' }));
+app.use(morgan(ENV === 'production' ? 'combined' : 'dev'));
 
-app.use(cors({
-  origin: (origin, cb) => {
-    if (!origin) return cb(null, true);
-    if (process.env.NODE_ENV !== 'production') return cb(null, true);
-    if (ALLOWED_ORIGINS.length === 0) return cb(null, true);
-    if (ALLOWED_ORIGINS.includes(origin)) return cb(null, true);
-    cb(new Error(`CORS: origin '${origin}' not allowed`));
-  },
-  credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-cron-secret', 'x-webhook-secret'],
-}));
+// ── Static files ──────────────────────────────────────────────────────────────
+app.use(express.static(path.join(__dirname, '..', 'public')));
 
-app.use(express.json({ limit: '1mb' }));
-app.use(express.urlencoded({ extended: false, limit: '1mb' }));
-
-if (process.env.NODE_ENV !== 'test') {
-  app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
-}
-
-app.use(rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 300,
-  standardHeaders: true,
-  legacyHeaders: false,
-  keyGenerator: (req) => req.ip,
-  message: { error: 'Too many requests, please try again later' },
-}));
-
-app.use('/api/v1/auth/login', rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-  keyGenerator: (req) => req.ip,
-  message: { error: 'Too many login attempts, please try again in 15 minutes' },
-}));
-
+// ── API routes ────────────────────────────────────────────────────────────────
 app.use('/api/v1', routes);
 
-const publicDir = path.join(__dirname, '..', 'public');
-app.use(express.static(publicDir, {
-  maxAge: process.env.NODE_ENV === 'production' ? '1d' : 0,
-  etag: true,
-}));
-
-app.get(/^(?!\/api\/).*$/, (req, res) => {
-  res.sendFile(path.join(publicDir, 'index.html'));
+// ── SPA catch-all ─────────────────────────────────────────────────────────────
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
 });
 
-app.use((req, res) => {
-  res.status(404).json({ error: 'Endpoint not found', path: req.path });
-});
-
+// ── Global error handler ──────────────────────────────────────────────────────
 app.use((err, req, res, _next) => {
-  const isProd = process.env.NODE_ENV === 'production';
-  console.error('[ERROR]', err.message, isProd ? '' : err.stack);
-  if (err.message && err.message.startsWith('CORS:')) {
-    return res.status(403).json({ error: err.message });
+  console.error('[ERROR]', err.message, err.stack);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+(async () => {
+  try {
+    initDb();
+    runMigrations();
+    startScheduler();
+    app.listen(PORT, () => {
+      console.log(`[SERVER] DormBook v2.0 on port ${PORT} (${ENV})`);
+      console.log(`[SERVER] DB: ${process.env.DATABASE_PATH || '/data/dormbook.db'}`);
+    });
+  } catch (err) {
+    console.error('[BOOT ERROR]', err.message);
+    process.exit(1);
   }
-  const status = err.status || err.statusCode || 500;
-  res.status(status).json({
-    error: isProd ? 'An internal error occurred' : err.message,
-  });
-});
-
-if (process.env.DISABLE_SCHEDULER !== 'true') {
-  startScheduler();
-}
-
-app.listen(PORT, '0.0.0.0', () => {
-  console.log(`[SERVER] DormBook v2.0 on port ${PORT} (${process.env.NODE_ENV || 'development'})`);
-  console.log(`[SERVER] DB: ${require('./db/init').DB_PATH}`);
-});
-
-module.exports = app;
+})();
