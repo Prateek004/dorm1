@@ -120,6 +120,22 @@ const TEMPLATES = {
       ]},
     ]),
   },
+  // FIX M-03: Added missing overstay_alert template.
+  // sendOverstayAlerts() in scheduler.js calls scheduleWhatsApp with eventType='overstay_alert'
+  // but this template did not exist — the call silently returned with a console.warn.
+  // Owners were never notified of residents who had passed their expected checkout date.
+  // Template name must match the pre-approved HSM template in Meta WABA.
+  overstay_alert: {
+    name: 'dormbook_overstay_alert',
+    language: 'en',
+    components: (data) => ([
+      { type: 'body', parameters: [
+        { type: 'text', text: data.name },
+        { type: 'text', text: data.expected_checkout },
+        { type: 'text', text: data.days_overdue.toString() },
+      ]},
+    ]),
+  },
 };
 
 async function sendViaProvider(to, template, components) {
