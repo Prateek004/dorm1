@@ -1284,7 +1284,7 @@ async function renderSettings(el) {
   try {
     // The settings are returned when we PATCH, but for reading we need the current values
     // We'll fetch via a dummy patch that changes nothing, or show the form with current known values
-    settings = await api('PATCH', '/properties/settings', {});
+settings = await api('GET', '/properties/settings');
   } catch(ex) {
     el.innerHTML = `<div class="error-msg">Could not load settings: ${ex.message}</div>`;
     return;
