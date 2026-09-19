@@ -35,13 +35,14 @@ function openDb(dbPath) {
 }
 
 function runMigrations(db) {
-  const getColumns = (table) => {
+  function getColumns(table) {
     try {
       return db.prepare(`SELECT name FROM pragma_table_info('${table}')`).all().map(c => c.name);
-    } catch { return []; }
-  };
+    } catch (e) {
+      return [];
+    }
+  }
 
-  // v2.1: bed base rate
   const bedCols = getColumns('beds');
   if (!bedCols.includes('base_rate_paise')) {
     db.exec("ALTER TABLE beds ADD COLUMN base_rate_paise INTEGER NOT NULL DEFAULT 0");
@@ -52,7 +53,6 @@ function runMigrations(db) {
     console.log('[MIGRATION] Added beds.daily_rate_paise');
   }
 
-  // v3: daily rate model on residents
   const resCols = getColumns('residents');
   if (!resCols.includes('rate_type')) {
     db.exec("ALTER TABLE residents ADD COLUMN rate_type TEXT NOT NULL DEFAULT 'monthly'");
@@ -61,29 +61,24 @@ function runMigrations(db) {
   if (!resCols.includes('rate_paise')) {
     db.exec("ALTER TABLE residents ADD COLUMN rate_paise INTEGER NOT NULL DEFAULT 0");
     db.exec("UPDATE residents SET rate_paise = monthly_rent_paise WHERE rate_paise = 0 AND monthly_rent_paise > 0");
-    console.log('[MIGRATION] Added residents.rate_paise');
+    console.log('[MIGRATION] Added residents.rate_paise (backfilled from monthly_rent_paise)');
   }
 
-  // v4: SaaS multi-tenancy
+  db.exec("UPDATE beds SET daily_rate_paise = base_rate_paise WHERE daily_rate_paise = 0 AND base_rate_paise > 0");
+
   const propCols = getColumns('properties');
   if (!propCols.includes('account_id')) {
-    // Add account_id to properties — existing rows get a placeholder, handled below
-    db.exec("ALTER TABLE properties ADD COLUMN account_id TEXT");
+    db.exec("ALTER TABLE properties ADD COLUMN account_id TEXT REFERENCES accounts(id)");
     console.log('[MIGRATION] Added properties.account_id');
   }
 
   const userCols = getColumns('users');
   if (!userCols.includes('account_id')) {
-    db.exec("ALTER TABLE users ADD COLUMN account_id TEXT");
-    console.log('[MIGRATION] Added users.account_id');
+    try {
+      db.exec("ALTER TABLE users ADD COLUMN account_id TEXT");
+      console.log('[MIGRATION] Added users.account_id');
+    } catch(e) { /* already exists */ }
   }
-  if (!userCols.includes('role') || !db.prepare("SELECT name FROM pragma_table_info('users') WHERE name='role'").get()) {
-    // role column already exists from original schema, but need to allow superadmin
-    // SQLite can't ALTER CHECK constraints, so we just rely on app-level validation
-  }
-
-  // Sync daily_rate_paise from base_rate_paise for existing beds
-  db.exec("UPDATE beds SET daily_rate_paise = base_rate_paise WHERE daily_rate_paise = 0 AND base_rate_paise > 0");
 
   console.log('[DB] Migrations complete');
 }
