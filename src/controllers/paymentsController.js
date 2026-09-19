@@ -9,11 +9,6 @@ const { generateReceipt } = require('../services/receiptService');
 const VALID_PAYMENT_MODES = ['cash', 'upi', 'card', 'bank_transfer'];
 const VALID_TYPES = ['rent', 'advance', 'extra_charge', 'deposit'];
 
-/**
- * Parse an integer paise value from request body.
- * Returns null for any non-numeric, NaN, Infinity, or non-positive-integer input.
- * Never returns NaN. Never crashes.
- */
 function parsePaise(v) {
   if (v === undefined || v === null || v === '') return null;
   const n = Number(v);
@@ -21,7 +16,6 @@ function parsePaise(v) {
   return Math.round(n);
 }
 
-/** Cap a text field. Returns null for missing/empty, truncated string otherwise. */
 function text(v, max) {
   if (v === undefined || v === null) return null;
   const s = String(v).trim();
@@ -29,33 +23,24 @@ function text(v, max) {
   return s.substring(0, max);
 }
 
-/**
- * POST /api/v1/payments
- * Record a rent/advance/extra_charge payment.
- */
 function recordPayment(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
-
   const {
     resident_id, amount_paise, type = 'rent', payment_mode = 'cash',
     billing_month, gateway_txn_id, due_date, notes,
   } = req.body;
 
   if (!resident_id) return res.status(400).json({ error: 'resident_id is required' });
-
   const amtPaise = parsePaise(amount_paise);
   if (amtPaise === null) return res.status(400).json({ error: 'amount_paise must be a number' });
   if (amtPaise <= 0) return res.status(400).json({ error: 'amount_paise must be > 0' });
-
   if (!VALID_TYPES.includes(type)) {
     return res.status(400).json({ error: `type must be one of: ${VALID_TYPES.join(', ')}` });
   }
-
   if (!VALID_PAYMENT_MODES.includes(payment_mode)) {
     return res.status(400).json({ error: `payment_mode must be one of: ${VALID_PAYMENT_MODES.join(', ')}` });
   }
-
   if (billing_month && !/^\d{4}-\d{2}$/.test(billing_month)) {
     return res.status(400).json({ error: 'billing_month must be in YYYY-MM format' });
   }
@@ -68,7 +53,7 @@ function recordPayment(req, res) {
   const now = new Date().toISOString();
   const paymentId = uuidv4();
   const safeGatewayTxnId = text(gateway_txn_id, 128);
-  const safeNotes        = text(notes, 500);
+  const safeNotes = text(notes, 500);
 
   db.prepare(`
     INSERT INTO payment_ledger
@@ -91,7 +76,6 @@ function recordPayment(req, res) {
     ip: req.ip,
   });
 
-  // Generate receipt async — errors must never crash the request
   generateReceipt({ db, paymentId, propertyId, residentId: resident_id, actorId: req.user.id })
     .then(receipt => {
       if (receipt && resident.mobile) {
@@ -114,7 +98,6 @@ function recordPayment(req, res) {
   return res.status(201).json({ message: 'Payment recorded', payment });
 }
 
-/** GET /api/v1/residents/:id/ledger */
 function getResidentLedger(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
@@ -129,10 +112,8 @@ function getResidentLedger(req, res) {
     'SELECT * FROM payment_ledger WHERE resident_id = ? ORDER BY created_at DESC'
   ).all(residentId);
 
-  const totalPaid       = ledger.filter(l => l.direction === 'credit').reduce((s, l) => s + l.amount_paise, 0);
-  const totalRefunded   = ledger.filter(l => l.direction === 'debit').reduce((s, l) => s + l.amount_paise, 0);
-  const balance         = totalPaid - totalRefunded;
-  const pendingApproval = ledger.filter(l => l.approval_status === 'pending');
+  const totalPaid     = ledger.filter(l => l.direction === 'credit').reduce((s, l) => s + l.amount_paise, 0);
+  const totalRefunded = ledger.filter(l => l.direction === 'debit').reduce((s, l) => s + l.amount_paise, 0);
 
   return res.json({
     resident,
@@ -140,13 +121,12 @@ function getResidentLedger(req, res) {
     summary: {
       total_paid_paise:     totalPaid,
       total_refunded_paise: totalRefunded,
-      balance_paise:        balance,
-      pending_approval:     pendingApproval.length,
+      balance_paise:        totalPaid - totalRefunded,
+      pending_approval:     ledger.filter(l => l.approval_status === 'pending').length,
     },
   });
 }
 
-/** GET /api/v1/payments/pending-approvals */
 function pendingApprovals(req, res) {
   const db = getDb();
   const list = db.prepare(`
@@ -159,7 +139,6 @@ function pendingApprovals(req, res) {
   return res.json(list);
 }
 
-/** POST /api/v1/payments/:id/approve */
 function approvePayment(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
@@ -193,7 +172,6 @@ function approvePayment(req, res) {
   return res.json({ message: `Payment ${decision}`, decision });
 }
 
-/** POST /api/v1/residents/:id/refund-deductions */
 function addRefundDeduction(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
@@ -221,13 +199,6 @@ function addRefundDeduction(req, res) {
   return res.status(201).json({ id, resident_id: residentId, amount_paise: amtPaise, reason: safeReason });
 }
 
-/**
- * GET /api/v1/residents/:id/refund-summary
- *
- * FIX M-01: Per-month outstanding dues calculation.
- * For each month from check_in to today, sum rent+advance credits. Any month
- * with credits < monthly_rent_paise contributes a blocking shortfall.
- */
 function getRefundSummary(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
@@ -247,9 +218,7 @@ function getRefundSummary(req, res) {
   ).get(residentId);
 
   const checkInMonth = resident.check_in_date ? resident.check_in_date.substring(0, 7) : null;
-  const today = new Date().toISOString().substring(0, 10);
-  const currentMonth = today.substring(0, 7);
-
+  const currentMonth = new Date().toISOString().substring(0, 7);
   let totalDuesPaise = 0;
 
   if (checkInMonth && resident.monthly_rent_paise > 0) {
@@ -277,8 +246,7 @@ function getRefundSummary(req, res) {
     }, {});
 
     for (const month of months) {
-      const paid = paidByMonth[month] || 0;
-      const shortfall = resident.monthly_rent_paise - paid;
+      const shortfall = resident.monthly_rent_paise - (paidByMonth[month] || 0);
       if (shortfall > 0) totalDuesPaise += shortfall;
     }
   }
