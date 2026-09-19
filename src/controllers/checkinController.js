@@ -6,7 +6,13 @@ const { writeAudit, logDocumentAccess } = require('../middleware/auditLog');
 const { encrypt, decrypt } = require('../services/encryption');
 const { scheduleWhatsApp } = require('../services/whatsappService');
 
-function paise(val) { return Math.round(parseFloat(val || 0)); }
+const { paise: parsePaise, int, text } = require('../util/input');
+
+// Absent means zero; present-but-unusable means null, so the caller can answer
+// 400 rather than binding NaN and turning the request into a 500.
+function paise(val) {
+  return val === undefined || val === null || val === '' ? 0 : parsePaise(val);
+}
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 // Ensure new columns exist before first use — runs once, idempotent
@@ -25,29 +31,40 @@ function ensureColumns(db) {
 }
 
 /**
- * POST /api/v1/residents — Check-in a new resident
+ * POST /api/v1/residents — Simplified check-in
  *
- * FIX H-01: Bed availability is now enforced atomically inside the transaction.
- * We attempt UPDATE beds SET status='occupied' WHERE id=? AND status IN ('available','reserved')
- * and check changes. If 0, the bed was taken between our validation read and the write — return 409.
- * This eliminates the TOCTOU race that allowed double-booking under concurrent requests.
+ * Mandatory: full_name, mobile, bed_id, check_in_date, expected_checkout, aadhaar_consent
+ * Rate: auto-fills from bed.daily_rate_paise, staff picks rate_type (daily/weekly/monthly)
  */
 function checkIn(req, res) {
   const db = getDb();
-  ensureColumns(db);
+  ensureColumns(db); // ensure rate_type + rate_paise columns exist
   const propertyId = req.user.property_id;
 
   const {
-    full_name, mobile, aadhaar_number, aadhaar_mobile, aadhaar_photo_path,
     aadhaar_consent,
-    coming_from, purpose_of_visit, permanent_address,
-    emergency_contact_name, emergency_contact_mobile, photo_path,
-    bed_id, check_in_date, expected_checkout,
     rate_type = 'daily', rate_paise: ratePaiseRaw,
     deposit_paise: depositPaiseRaw,
-    amount_paid_paise: paidPaiseRaw, payment_mode, gateway_txn_id, notes,
-    rent_due_day = 1,
+    amount_paid_paise: paidPaiseRaw, payment_mode, gateway_txn_id,
   } = req.body;
+
+  // Every free-text field is normalised first: a non-string here used to reach
+  // .trim() or the SQLite binding and turn a check-in into a 500.
+  const full_name                = text(req.body.full_name, 100);
+  const mobile                   = text(req.body.mobile, 20);
+  const bed_id                   = text(req.body.bed_id, 64);
+  const check_in_date            = text(req.body.check_in_date, 10);
+  const expected_checkout        = text(req.body.expected_checkout, 10);
+  const aadhaar_number           = text(req.body.aadhaar_number, 20);
+  const aadhaar_mobile           = text(req.body.aadhaar_mobile, 20);
+  const aadhaar_photo_path       = text(req.body.aadhaar_photo_path, 300);
+  const coming_from              = text(req.body.coming_from, 120);
+  const purpose_of_visit         = text(req.body.purpose_of_visit, 120);
+  const permanent_address        = text(req.body.permanent_address, 400);
+  const emergency_contact_name   = text(req.body.emergency_contact_name, 100);
+  const emergency_contact_mobile = text(req.body.emergency_contact_mobile, 20);
+  const photo_path               = text(req.body.photo_path, 300);
+  const notes                    = text(req.body.notes, 500);
 
   // Required fields
   const required = { full_name, mobile, bed_id, check_in_date, expected_checkout };
@@ -56,7 +73,7 @@ function checkIn(req, res) {
   }
   if (!aadhaar_consent) return res.status(400).json({ error: 'Aadhaar consent required' });
 
-  const mobileClean = String(mobile).replace(/\D/g, '');
+  const mobileClean = mobile.replace(/\D/g, '');
   if (mobileClean.length < 10 || mobileClean.length > 12) return res.status(400).json({ error: 'Invalid mobile' });
   if (!DATE_RE.test(check_in_date)) return res.status(400).json({ error: 'check_in_date: YYYY-MM-DD' });
   if (!DATE_RE.test(expected_checkout)) return res.status(400).json({ error: 'expected_checkout: YYYY-MM-DD' });
@@ -65,17 +82,33 @@ function checkIn(req, res) {
   const RATE_TYPES = ['daily', 'weekly', 'monthly'];
   if (!RATE_TYPES.includes(rate_type)) return res.status(400).json({ error: `rate_type must be: ${RATE_TYPES.join(', ')}` });
 
-  // Pre-flight read: verify bed exists and belongs to this property.
-  // Status check is NOT authoritative here — the atomic UPDATE inside the transaction is.
+  const MODES = ['cash', 'upi', 'card', 'bank_transfer'];
+  const mode  = MODES.includes(payment_mode) ? payment_mode : 'cash';
+
+  // rent_due_day drives every future rent reminder; an out-of-range value would
+  // silently schedule reminders on a day that does not exist in short months.
+  const rent_due_day = int(req.body.rent_due_day) ?? 1;
+  if (rent_due_day < 1 || rent_due_day > 28) {
+    return res.status(400).json({ error: 'rent_due_day must be between 1 and 28' });
+  }
+
+  // Bed check
   const bed = db.prepare('SELECT * FROM beds WHERE id = ? AND property_id = ?').get(bed_id, propertyId);
   if (!bed) return res.status(404).json({ error: 'Bed not found' });
-  // Early rejection for obviously wrong states (saves transaction overhead for clearly occupied beds)
   if (bed.status !== 'available' && bed.status !== 'reserved') {
     return res.status(409).json({ error: `Bed is '${bed.status}' — only available or reserved beds` });
   }
 
   // Rate: use provided rate, else derive from bed daily rate
   let ratePaise = paise(ratePaiseRaw);
+  const depositPaise = paise(depositPaiseRaw);
+  const paidPaise = paise(paidPaiseRaw);
+
+  for (const [field, val] of [['rate_paise', ratePaise], ['deposit_paise', depositPaise], ['amount_paid_paise', paidPaise]]) {
+    if (val === null) return res.status(400).json({ error: `${field} must be a number` });
+    if (val < 0)      return res.status(400).json({ error: `${field} must be ≥ 0` });
+  }
+
   if (!ratePaise && bed.daily_rate_paise) {
     if (rate_type === 'daily') ratePaise = bed.daily_rate_paise;
     else if (rate_type === 'weekly') ratePaise = bed.daily_rate_paise * 7;
@@ -87,30 +120,20 @@ function checkIn(req, res) {
   if (rate_type === 'daily') monthlyRent = ratePaise * 30;
   else if (rate_type === 'weekly') monthlyRent = ratePaise * 4;
 
-  const depositPaise = paise(depositPaiseRaw);
-  const paidPaise = paise(paidPaiseRaw);
-
-  // Aadhaar
-  const aadhaarEncrypted = aadhaar_number ? encrypt(String(aadhaar_number).replace(/\s/g, '')) : null;
-  const aadhaarLast4 = aadhaar_number ? String(aadhaar_number).replace(/\s/g, '').slice(-4) : null;
+  // Aadhaar — 12 digits, or reject. A half-typed number encrypts fine but makes
+  // the stored last4 meaningless, so the record cannot be matched later.
+  const aadhaarDigits = aadhaar_number ? aadhaar_number.replace(/\D/g, '') : null;
+  if (aadhaarDigits && aadhaarDigits.length !== 12) {
+    return res.status(400).json({ error: 'Aadhaar number must be 12 digits' });
+  }
+  const aadhaarEncrypted = aadhaarDigits ? encrypt(aadhaarDigits) : null;
+  const aadhaarLast4 = aadhaarDigits ? aadhaarDigits.slice(-4) : null;
 
   const now = new Date().toISOString();
   const residentId = uuidv4();
   const billingMonth = check_in_date.substring(0, 7);
 
-  // FIX H-01: Atomic bed claim inside transaction.
-  // UPDATE returns changes=0 if bed was already taken by a concurrent request.
-  let raceDetected = false;
-  db.transaction(() => {
-    const { changes } = db.prepare(
-      "UPDATE beds SET status='occupied', cleaning_started_at=NULL, booking_request_id=NULL, updated_at=datetime('now') WHERE id=? AND property_id=? AND status IN ('available','reserved')"
-    ).run(bed_id, propertyId);
-
-    if (changes === 0) {
-      raceDetected = true;
-      return;
-    }
-
+  const runCheckIn = () => {
     db.prepare(`
       INSERT INTO residents
         (id, property_id, bed_id, full_name, mobile,
@@ -121,16 +144,16 @@ function checkIn(req, res) {
          photo_path, check_in_date, expected_checkout, rent_due_day,
          monthly_rent_paise, rate_type, rate_paise, deposit_paise, status,
          notes, checkin_by, created_at, updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'active',?,?,?,?)
+      VALUES (?,?,?,?,?,?,?,?,?,1,?,?,?,?,?,?,?,?,?,?,?,?,?,?,  'active',?,?,?,?)
     `).run(
-      residentId, propertyId, bed_id, full_name.trim(), mobileClean,
-      aadhaarEncrypted, aadhaarLast4, aadhaar_mobile || null, aadhaar_photo_path || null,
+      residentId, propertyId, bed_id, full_name, mobileClean,
+      aadhaarEncrypted, aadhaarLast4, aadhaar_mobile, aadhaar_photo_path,
       now,
-      coming_from || null, permanent_address || null, purpose_of_visit || null,
-      emergency_contact_name || null, emergency_contact_mobile || null,
-      photo_path || null, check_in_date, expected_checkout, rent_due_day,
+      coming_from, permanent_address, purpose_of_visit,
+      emergency_contact_name, emergency_contact_mobile,
+      photo_path, check_in_date, expected_checkout, rent_due_day,
       monthlyRent, rate_type, ratePaise, depositPaise,
-      notes || null, req.user.id, now, now
+      notes, req.user.id, now, now
     );
 
     if (depositPaise > 0) {
@@ -140,7 +163,7 @@ function checkIn(req, res) {
            payment_mode,gateway_txn_id,paid_at,requires_approval,approval_status,notes,recorded_by,created_at)
         VALUES (?,?,?,?,?,'credit','deposit',?,?,?,0,'not_required',?,?,?)
       `).run(uuidv4(), propertyId, residentId, billingMonth, depositPaise,
-        payment_mode || 'cash', gateway_txn_id || null, now, 'Deposit on check-in', req.user.id, now);
+        mode, text(gateway_txn_id, 64), now, 'Deposit on check-in', req.user.id, now);
     }
 
     if (paidPaise > 0) {
@@ -150,17 +173,37 @@ function checkIn(req, res) {
            payment_mode,gateway_txn_id,paid_at,requires_approval,approval_status,notes,recorded_by,created_at)
         VALUES (?,?,?,?,?,'credit','advance',?,?,?,0,'not_required',?,?,?)
       `).run(uuidv4(), propertyId, residentId, billingMonth, paidPaise,
-        payment_mode || 'cash', gateway_txn_id || null, now, 'Advance on check-in', req.user.id, now);
+        mode, text(gateway_txn_id, 64), now, 'Advance on check-in', req.user.id, now);
+    }
+
+    // Claim the bed conditionally on it still being free. The status was read
+    // before the transaction opened; re-asserting it here means the bed is won
+    // by exactly one check-in even if two arrive together, instead of relying
+    // on nothing yielding between the read and the write.
+    const claimed = db.prepare(`
+      UPDATE beds SET status='occupied', cleaning_started_at=NULL, booking_request_id=NULL,
+                      updated_at=datetime('now')
+      WHERE id=? AND status IN ('available','reserved')
+    `).run(bed_id);
+    if (claimed.changes === 0) {
+      bedTaken = true;
+      throw new Error('BED_TAKEN');   // rolls the whole check-in back
     }
 
     if (bed.status === 'reserved' && bed.booking_request_id) {
       db.prepare(`UPDATE booking_requests SET status='confirmed', converted_to_resident_id=? WHERE id=? AND status IN ('pending','confirmed')`)
         .run(residentId, bed.booking_request_id);
     }
-  })();
+  };
 
-  if (raceDetected) {
-    return res.status(409).json({ error: 'Bed is no longer available — it was just taken' });
+  let bedTaken = false;
+  try {
+    db.transaction(runCheckIn)();
+  } catch (err) {
+    if (bedTaken) {
+      return res.status(409).json({ error: 'Bed was just taken by another check-in' });
+    }
+    throw err;
   }
 
   writeAudit({ propertyId, userId: req.user.id, action: 'CHECKIN',
@@ -242,69 +285,57 @@ function getResident(req, res) {
   return res.json({ ...resident, payments });
 }
 
-/**
- * POST /api/v1/residents/:id/checkout
- *
- * FIX H-02: Resident status is now claimed atomically inside the transaction.
- * We UPDATE residents SET status='pending_checkout' WHERE id=? AND status='active'
- * and check changes. If 0, another request already claimed the checkout — return 409.
- * This eliminates the TOCTOU race that allowed duplicate payment_ledger rows.
- */
+/** POST /api/v1/residents/:id/checkout */
 function checkOut(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
   const { id: residentId } = req.params;
-  const { checkout_date, extra_charges_paise = 0, extra_charges_note,
-    deposit_refund_paise = 0, payment_mode, gateway_txn_id, notes } = req.body;
+  const { extra_charges_note, payment_mode, gateway_txn_id, notes } = req.body;
+  const checkout_date = text(req.body.checkout_date, 10);
   if (!checkout_date) return res.status(400).json({ error: 'checkout_date required' });
   if (!DATE_RE.test(checkout_date)) return res.status(400).json({ error: 'checkout_date: YYYY-MM-DD' });
+
+  const refundPaiseIn = paise(req.body.deposit_refund_paise);
+  const extraPaiseIn  = paise(req.body.extra_charges_paise);
+  for (const [field, val] of [['deposit_refund_paise', refundPaiseIn], ['extra_charges_paise', extraPaiseIn]]) {
+    if (val === null) return res.status(400).json({ error: `${field} must be a number` });
+    if (val < 0)      return res.status(400).json({ error: `${field} must be ≥ 0` });
+  }
+  const MODES = ['cash', 'upi', 'card', 'bank_transfer'];
+  const mode  = MODES.includes(payment_mode) ? payment_mode : 'cash';
 
   const resident = db.prepare('SELECT * FROM residents WHERE id = ? AND property_id = ?').get(residentId, propertyId);
   if (!resident) return res.status(404).json({ error: 'Resident not found' });
   if (resident.status === 'checked_out') return res.status(409).json({ error: 'Already checked out' });
-  if (resident.status === 'pending_checkout') return res.status(409).json({ error: 'Checkout already in progress' });
 
   const now = new Date().toISOString();
-  const refundPaise = Math.round(parseFloat(deposit_refund_paise) || 0);
-  const extraPaise = Math.round(parseFloat(extra_charges_paise) || 0);
+  const refundPaise = refundPaiseIn;
+  const extraPaise  = extraPaiseIn;
 
   const prop = db.prepare('SELECT refund_approval_threshold_paise FROM properties WHERE id = ?').get(propertyId);
   const threshold = prop?.refund_approval_threshold_paise ?? 0;
   const needsApproval = refundPaise > threshold;
   let refundPaymentId = null;
-  let raceDetected = false;
 
   db.transaction(() => {
-    // FIX H-02: Atomic status claim. If changes=0, another concurrent checkout won the race.
-    const { changes } = db.prepare(
-      "UPDATE residents SET status='pending_checkout', updated_at=datetime('now') WHERE id=? AND property_id=? AND status='active'"
-    ).run(residentId, propertyId);
-
-    if (changes === 0) {
-      raceDetected = true;
-      return;
-    }
-
     if (extraPaise > 0) {
       db.prepare(`INSERT INTO payment_ledger (id,property_id,resident_id,billing_month,amount_paise,direction,type,payment_mode,paid_at,requires_approval,approval_status,notes,recorded_by,created_at)
         VALUES (?,?,?,?,?,'credit','extra_charge',?,?,0,'not_required',?,?,?)`)
-        .run(uuidv4(), propertyId, residentId, checkout_date.substring(0,7), extraPaise, payment_mode||'cash', now, extra_charges_note||'Extra charges at checkout', req.user.id, now);
+        .run(uuidv4(), propertyId, residentId, checkout_date.substring(0,7), extraPaise, mode, now, extra_charges_note||'Extra charges at checkout', req.user.id, now);
     }
     if (refundPaise > 0) {
       refundPaymentId = uuidv4();
-      db.prepare(`INSERT INTO payment_ledger (id,property_id,resident_id,billing_month,amount_paise,direction,type,payment_mode,gateway_txn_id,paid_at,requires_approval,approval_status,notes,recorded_by,created_at)
-        VALUES (?,?,?,?,?,'debit','deposit_refund',?,?,?,?,?,?,?,?)`)
-        .run(refundPaymentId, propertyId, residentId, checkout_date.substring(0,7), refundPaise, payment_mode||'cash', gateway_txn_id||null, now, needsApproval?1:0, needsApproval?'pending':'not_required', notes||'Deposit refund', req.user.id, now);
+      // due_date carries the staff-recorded checkout_date so approveCheckout
+      // can restore it as actual_checkout instead of using the approval time.
+      db.prepare(`INSERT INTO payment_ledger (id,property_id,resident_id,billing_month,amount_paise,direction,type,payment_mode,gateway_txn_id,due_date,paid_at,requires_approval,approval_status,notes,recorded_by,created_at)
+        VALUES (?,?,?,?,?,'debit','deposit_refund',?,?,?,?,?,?,?,?,?)`)
+        .run(refundPaymentId, propertyId, residentId, checkout_date.substring(0,7), refundPaise, mode, gateway_txn_id||null, checkout_date, now, needsApproval?1:0, needsApproval?'pending':'not_required', notes||'Deposit refund', req.user.id, now);
     }
     if (!needsApproval) {
       db.prepare(`UPDATE residents SET status='checked_out', actual_checkout=?, updated_at=datetime('now') WHERE id=?`).run(checkout_date, residentId);
       if (resident.bed_id) db.prepare(`UPDATE beds SET status='cleaning', cleaning_started_at=datetime('now'), updated_at=datetime('now') WHERE id=?`).run(resident.bed_id);
     }
   })();
-
-  if (raceDetected) {
-    return res.status(409).json({ error: 'Checkout already in progress for this resident' });
-  }
 
   writeAudit({ propertyId, userId: req.user.id, action: 'CHECKOUT_INITIATED',
     entityType: 'resident', entityId: residentId, amountPaise: refundPaise,
@@ -315,11 +346,7 @@ function checkOut(req, res) {
     refund_pending_approval: needsApproval, refund_payment_id: refundPaymentId });
 }
 
-/**
- * POST /api/v1/residents/:id/checkout/approve
- *
- * FIX L-01: Removed datetime('now','localtime') — all timestamps use UTC.
- */
+/** POST /api/v1/residents/:id/checkout/approve */
 function approveCheckout(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
@@ -337,12 +364,11 @@ function approveCheckout(req, res) {
     db.prepare(`UPDATE payment_ledger SET approval_status=?, approved_by=?, approved_at=?, notes=COALESCE(?,notes) WHERE id=?`)
       .run(decision, req.user.id, now, notes||null, refund.id);
     if (decision === 'approved') {
-      // FIX L-01: Use datetime('now') — UTC only, consistent with all other timestamps.
-      db.prepare(`UPDATE residents SET status='checked_out', actual_checkout=datetime('now'), updated_at=datetime('now') WHERE id=?`).run(residentId);
+      // Use the checkout_date the staff recorded at checkout time (stored in
+      // due_date), not the approval timestamp — they can be days apart.
+      const actualCheckout = refund.due_date || new Date().toISOString().substring(0, 10);
+      db.prepare(`UPDATE residents SET status='checked_out', actual_checkout=?, updated_at=datetime('now') WHERE id=?`).run(actualCheckout, residentId);
       if (resident.bed_id) db.prepare(`UPDATE beds SET status='cleaning', cleaning_started_at=datetime('now'), updated_at=datetime('now') WHERE id=?`).run(resident.bed_id);
-    } else {
-      // Rejected: revert resident back to active so checkout can be re-attempted
-      db.prepare(`UPDATE residents SET status='active', updated_at=datetime('now') WHERE id=?`).run(residentId);
     }
   })();
   writeAudit({ propertyId, userId: req.user.id, action: decision==='approved'?'CHECKOUT_APPROVED':'CHECKOUT_REJECTED',
@@ -363,7 +389,12 @@ function extendStay(req, res) {
   if (new_expected_checkout <= resident.expected_checkout) return res.status(400).json({ error: 'New date must be after current' });
 
   const now = new Date().toISOString();
-  const newRate = new_rate_paise !== undefined ? Math.round(parseFloat(new_rate_paise)) : resident.rate_paise;
+  let newRate = resident.rate_paise;
+  if (new_rate_paise !== undefined) {
+    newRate = parsePaise(new_rate_paise);
+    if (newRate === null) return res.status(400).json({ error: 'new_rate_paise must be a number' });
+    if (newRate < 0)      return res.status(400).json({ error: 'new_rate_paise must be ≥ 0' });
+  }
   const newType = new_rate_type || resident.rate_type;
 
   db.transaction(() => {
@@ -380,7 +411,7 @@ function extendStay(req, res) {
   return res.json({ message: 'Stay extended', resident: updated });
 }
 
-/** PATCH /api/v1/residents/:id/rent */
+/** PATCH /api/v1/residents/:id/rent — change rate without extending */
 function updateResidentRent(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
@@ -391,7 +422,9 @@ function updateResidentRent(req, res) {
   const resident = db.prepare("SELECT * FROM residents WHERE id = ? AND property_id = ? AND status = 'active'").get(id, propertyId);
   if (!resident) return res.status(404).json({ error: 'Active resident not found' });
 
-  const newRate = Math.round(parseFloat(rate_paise));
+  const newRate = parsePaise(rate_paise);
+  if (newRate === null) return res.status(400).json({ error: 'rate_paise must be a number' });
+  if (newRate < 0)      return res.status(400).json({ error: 'rate_paise must be ≥ 0' });
   const newType = rate_type || resident.rate_type;
   const monthlyRent = newType==='daily'?newRate*30:newType==='weekly'?newRate*4:newRate;
 
