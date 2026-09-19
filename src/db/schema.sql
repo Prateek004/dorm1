@@ -1,18 +1,35 @@
 -- ============================================================
--- DormBook — SQLite Schema v2.1 (Production)
+-- DormBook — SQLite Schema v4.0 (SaaS)
 -- All monetary values in PAISE (integer). UTC timestamps.
 -- ============================================================
 
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
+-- ── Accounts (one per PG business, SaaS tenant) ───────────
+CREATE TABLE IF NOT EXISTS accounts (
+  id              TEXT PRIMARY KEY,
+  business_name   TEXT NOT NULL,
+  owner_name      TEXT NOT NULL,
+  owner_mobile    TEXT NOT NULL UNIQUE,
+  owner_email     TEXT UNIQUE,
+  plan            TEXT NOT NULL DEFAULT 'trial'
+                    CHECK (plan IN ('trial','active','suspended')),
+  trial_ends_at   TEXT NOT NULL,
+  suspended_at    TEXT,
+  suspend_reason  TEXT,
+  created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- ── Properties ────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS properties (
   id                               TEXT PRIMARY KEY,
+  account_id                       TEXT NOT NULL,
   name                             TEXT NOT NULL,
-  address                          TEXT NOT NULL,
-  city                             TEXT NOT NULL,
-  state                            TEXT NOT NULL,
+  address                          TEXT NOT NULL DEFAULT '',
+  city                             TEXT NOT NULL DEFAULT '',
+  state                            TEXT NOT NULL DEFAULT '',
   pincode                          TEXT,
   owner_id                         TEXT NOT NULL,
   whatsapp_number                  TEXT,
@@ -25,23 +42,36 @@ CREATE TABLE IF NOT EXISTS properties (
   booking_lock_hours               INTEGER NOT NULL DEFAULT 24,
   property_code                    TEXT    NOT NULL DEFAULT 'PROP',
   created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (account_id) REFERENCES accounts(id)
 );
 
 -- ── Users ─────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS users (
   id            TEXT PRIMARY KEY,
-  property_id   TEXT NOT NULL,
+  account_id    TEXT,
+  property_id   TEXT,
   name          TEXT NOT NULL,
   email         TEXT UNIQUE,
   mobile        TEXT NOT NULL,
   password_hash TEXT NOT NULL,
   role          TEXT NOT NULL DEFAULT 'reception'
-                  CHECK (role IN ('owner', 'manager', 'reception')),
+                  CHECK (role IN ('superadmin', 'owner', 'manager', 'reception')),
   is_active     INTEGER NOT NULL DEFAULT 1,
   created_at    TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (account_id)  REFERENCES accounts(id),
   FOREIGN KEY (property_id) REFERENCES properties(id)
+);
+
+-- ── OTP Store (password reset via WhatsApp) ───────────────
+CREATE TABLE IF NOT EXISTS otp_store (
+  id          TEXT PRIMARY KEY,
+  mobile      TEXT NOT NULL,
+  otp_hash    TEXT NOT NULL,
+  expires_at  TEXT NOT NULL,
+  used        INTEGER NOT NULL DEFAULT 0,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- ── Property hierarchy ─────────────────────────────────────
@@ -109,7 +139,7 @@ CREATE TABLE IF NOT EXISTS residents (
   status                   TEXT NOT NULL DEFAULT 'active'
                              CHECK (status IN ('active','checked_out')),
   monthly_rent_paise       INTEGER NOT NULL DEFAULT 0,
-  rate_type                TEXT    NOT NULL DEFAULT 'daily'
+  rate_type                TEXT    NOT NULL DEFAULT 'monthly'
                              CHECK (rate_type IN ('daily','weekly','monthly')),
   rate_paise               INTEGER NOT NULL DEFAULT 0,
   deposit_paise            INTEGER NOT NULL DEFAULT 0,
@@ -352,18 +382,21 @@ CREATE TABLE IF NOT EXISTS notification_log (
 );
 
 -- ── Indexes ───────────────────────────────────────────────
-CREATE INDEX IF NOT EXISTS idx_beds_property       ON beds(property_id);
-CREATE INDEX IF NOT EXISTS idx_beds_status         ON beds(status);
-CREATE INDEX IF NOT EXISTS idx_residents_property  ON residents(property_id);
-CREATE INDEX IF NOT EXISTS idx_residents_status    ON residents(status);
-CREATE INDEX IF NOT EXISTS idx_residents_bed       ON residents(bed_id, status);
-CREATE INDEX IF NOT EXISTS idx_ledger_resident     ON payment_ledger(resident_id);
-CREATE INDEX IF NOT EXISTS idx_ledger_property_date ON payment_ledger(property_id, paid_at);
-CREATE INDEX IF NOT EXISTS idx_ledger_approval     ON payment_ledger(approval_status, type);
-CREATE INDEX IF NOT EXISTS idx_audit_property_date ON audit_log(property_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_expenses_property   ON expenses(property_id, expense_date);
-CREATE INDEX IF NOT EXISTS idx_notification_status ON notification_log(status, created_at);
-CREATE INDEX IF NOT EXISTS idx_booking_status      ON booking_requests(status, lock_expires_at);
-CREATE INDEX IF NOT EXISTS idx_feedback_property   ON tenant_feedback(property_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_receipts_number     ON receipts(receipt_number);
-CREATE INDEX IF NOT EXISTS idx_doc_access_resident ON document_access_log(resident_id);
+CREATE INDEX IF NOT EXISTS idx_accounts_mobile       ON accounts(owner_mobile);
+CREATE INDEX IF NOT EXISTS idx_accounts_plan         ON accounts(plan);
+CREATE INDEX IF NOT EXISTS idx_beds_property         ON beds(property_id);
+CREATE INDEX IF NOT EXISTS idx_beds_status           ON beds(status);
+CREATE INDEX IF NOT EXISTS idx_residents_property    ON residents(property_id);
+CREATE INDEX IF NOT EXISTS idx_residents_status      ON residents(status);
+CREATE INDEX IF NOT EXISTS idx_residents_bed         ON residents(bed_id, status);
+CREATE INDEX IF NOT EXISTS idx_ledger_resident       ON payment_ledger(resident_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_property_date  ON payment_ledger(property_id, paid_at);
+CREATE INDEX IF NOT EXISTS idx_ledger_approval       ON payment_ledger(approval_status, type);
+CREATE INDEX IF NOT EXISTS idx_audit_property_date   ON audit_log(property_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_expenses_property     ON expenses(property_id, expense_date);
+CREATE INDEX IF NOT EXISTS idx_notification_status   ON notification_log(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_booking_status        ON booking_requests(status, lock_expires_at);
+CREATE INDEX IF NOT EXISTS idx_feedback_property     ON tenant_feedback(property_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_receipts_number       ON receipts(receipt_number);
+CREATE INDEX IF NOT EXISTS idx_doc_access_resident   ON document_access_log(resident_id);
+CREATE INDEX IF NOT EXISTS idx_otp_mobile            ON otp_store(mobile, expires_at);
