@@ -1,37 +1,34 @@
 -- ============================================================
--- DormBook — SQLite Schema v4.0 (SaaS)
+-- DormBook — SQLite Schema v4.0 (SaaS Multi-tenant)
 -- All monetary values in PAISE (integer). UTC timestamps.
 -- ============================================================
 
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
--- ── Accounts (one per PG business, SaaS tenant) ───────────
+-- ── Accounts (one per PG business / SaaS tenant) ──────────
 CREATE TABLE IF NOT EXISTS accounts (
-  id              TEXT PRIMARY KEY,
-  business_name   TEXT NOT NULL,
-  owner_name      TEXT NOT NULL,
-  owner_mobile    TEXT NOT NULL UNIQUE,
-  owner_email     TEXT UNIQUE,
-  plan            TEXT NOT NULL DEFAULT 'trial'
-                    CHECK (plan IN ('trial','active','suspended')),
-  trial_ends_at   TEXT NOT NULL,
-  suspended_at    TEXT,
-  suspend_reason  TEXT,
-  created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-  updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+  id                TEXT PRIMARY KEY,
+  business_name     TEXT NOT NULL,
+  plan              TEXT NOT NULL DEFAULT 'trial'
+                      CHECK (plan IN ('trial','active','suspended')),
+  trial_ends_at     TEXT,
+  suspended_at      TEXT,
+  suspension_reason TEXT,
+  created_at        TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 -- ── Properties ────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS properties (
   id                               TEXT PRIMARY KEY,
-  account_id                       TEXT NOT NULL,
+  account_id                       TEXT,
   name                             TEXT NOT NULL,
-  address                          TEXT NOT NULL DEFAULT '',
-  city                             TEXT NOT NULL DEFAULT '',
-  state                            TEXT NOT NULL DEFAULT '',
+  address                          TEXT,
+  city                             TEXT,
+  state                            TEXT,
   pincode                          TEXT,
-  owner_id                         TEXT NOT NULL,
+  owner_id                         TEXT,
   whatsapp_number                  TEXT,
   cleaning_timeout_minutes         INTEGER NOT NULL DEFAULT 120,
   refund_approval_threshold_paise  INTEGER NOT NULL DEFAULT 0,
@@ -56,7 +53,7 @@ CREATE TABLE IF NOT EXISTS users (
   mobile        TEXT NOT NULL,
   password_hash TEXT NOT NULL,
   role          TEXT NOT NULL DEFAULT 'reception'
-                  CHECK (role IN ('superadmin', 'owner', 'manager', 'reception')),
+                  CHECK (role IN ('superadmin','owner', 'manager', 'reception')),
   is_active     INTEGER NOT NULL DEFAULT 1,
   created_at    TEXT NOT NULL DEFAULT (datetime('now')),
   updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
@@ -64,14 +61,14 @@ CREATE TABLE IF NOT EXISTS users (
   FOREIGN KEY (property_id) REFERENCES properties(id)
 );
 
--- ── OTP Store (password reset via WhatsApp) ───────────────
+-- ── OTP Store (for WhatsApp password reset) ───────────────
 CREATE TABLE IF NOT EXISTS otp_store (
-  id          TEXT PRIMARY KEY,
-  mobile      TEXT NOT NULL,
-  otp_hash    TEXT NOT NULL,
-  expires_at  TEXT NOT NULL,
-  used        INTEGER NOT NULL DEFAULT 0,
-  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  id         TEXT PRIMARY KEY,
+  mobile     TEXT NOT NULL,
+  otp_hash   TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE (mobile)
 );
 
 -- ── Property hierarchy ─────────────────────────────────────
@@ -139,7 +136,7 @@ CREATE TABLE IF NOT EXISTS residents (
   status                   TEXT NOT NULL DEFAULT 'active'
                              CHECK (status IN ('active','checked_out')),
   monthly_rent_paise       INTEGER NOT NULL DEFAULT 0,
-  rate_type                TEXT    NOT NULL DEFAULT 'monthly'
+  rate_type                TEXT    NOT NULL DEFAULT 'daily'
                              CHECK (rate_type IN ('daily','weekly','monthly')),
   rate_paise               INTEGER NOT NULL DEFAULT 0,
   deposit_paise            INTEGER NOT NULL DEFAULT 0,
@@ -235,168 +232,4 @@ CREATE TABLE IF NOT EXISTS audit_log (
   FOREIGN KEY (actor_id)    REFERENCES users(id)
 );
 
--- ── Document Access Log (DPDP compliance) ─────────────────
-CREATE TABLE IF NOT EXISTS document_access_log (
-  id            TEXT PRIMARY KEY,
-  resident_id   TEXT NOT NULL,
-  accessed_by   TEXT NOT NULL,
-  document_type TEXT NOT NULL
-                  CHECK (document_type IN ('aadhaar_number','aadhaar_photo')),
-  ip_address    TEXT,
-  accessed_at   TEXT NOT NULL DEFAULT (datetime('now')),
-  FOREIGN KEY (resident_id) REFERENCES residents(id),
-  FOREIGN KEY (accessed_by) REFERENCES users(id)
-);
-
--- ── Booking Requests ──────────────────────────────────────
-CREATE TABLE IF NOT EXISTS booking_requests (
-  id                      TEXT PRIMARY KEY,
-  property_id             TEXT NOT NULL,
-  bed_id                  TEXT NOT NULL,
-  prospect_name           TEXT NOT NULL,
-  prospect_phone          TEXT NOT NULL,
-  status                  TEXT NOT NULL DEFAULT 'pending'
-                            CHECK (status IN ('pending','confirmed','expired','cancelled')),
-  advance_deposit_paise   INTEGER NOT NULL DEFAULT 0,
-  lock_expires_at         TEXT NOT NULL,
-  converted_to_resident_id TEXT,
-  created_by              TEXT NOT NULL,
-  created_at              TEXT NOT NULL DEFAULT (datetime('now')),
-  FOREIGN KEY (property_id) REFERENCES properties(id),
-  FOREIGN KEY (bed_id)      REFERENCES beds(id),
-  FOREIGN KEY (created_by)  REFERENCES users(id)
-);
-
--- ── Refund Deductions ─────────────────────────────────────
-CREATE TABLE IF NOT EXISTS refund_deductions (
-  id          TEXT PRIMARY KEY,
-  resident_id TEXT NOT NULL,
-  amount_paise INTEGER NOT NULL,
-  reason      TEXT NOT NULL,
-  logged_by   TEXT NOT NULL,
-  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-  FOREIGN KEY (resident_id) REFERENCES residents(id),
-  FOREIGN KEY (logged_by)   REFERENCES users(id)
-);
-
--- ── Cash Reconciliations ──────────────────────────────────
-CREATE TABLE IF NOT EXISTS cash_reconciliations (
-  id                  TEXT PRIMARY KEY,
-  property_id         TEXT NOT NULL,
-  date                TEXT NOT NULL,
-  drawer_amount_paise INTEGER NOT NULL,
-  system_amount_paise INTEGER NOT NULL,
-  delta_paise         INTEGER NOT NULL,
-  is_discrepancy      INTEGER NOT NULL DEFAULT 0,
-  owner_note          TEXT,
-  submitted_by        TEXT NOT NULL,
-  created_at          TEXT NOT NULL DEFAULT (datetime('now')),
-  FOREIGN KEY (property_id) REFERENCES properties(id),
-  FOREIGN KEY (submitted_by) REFERENCES users(id)
-);
-
--- ── Add-on Catalog ────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS addon_catalog (
-  id                  TEXT PRIMARY KEY,
-  property_id         TEXT NOT NULL,
-  name                TEXT NOT NULL,
-  category            TEXT NOT NULL,
-  default_price_paise INTEGER NOT NULL DEFAULT 0,
-  is_assignable       INTEGER NOT NULL DEFAULT 0,
-  is_active           INTEGER NOT NULL DEFAULT 1,
-  created_at          TEXT NOT NULL DEFAULT (datetime('now')),
-  FOREIGN KEY (property_id) REFERENCES properties(id)
-);
-
--- ── Add-on Charges ────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS addon_charges (
-  id                    TEXT PRIMARY KEY,
-  resident_id           TEXT NOT NULL,
-  property_id           TEXT NOT NULL,
-  catalog_item_id       TEXT,
-  name                  TEXT NOT NULL,
-  amount_paise          INTEGER NOT NULL,
-  billing_mode          TEXT NOT NULL DEFAULT 'immediate'
-                          CHECK (billing_mode IN ('immediate','monthly_bill')),
-  is_custom_entry       INTEGER NOT NULL DEFAULT 0,
-  custom_reason         TEXT,
-  assigned_item_returned INTEGER,
-  billing_month         TEXT,
-  recorded_by           TEXT NOT NULL,
-  created_at            TEXT NOT NULL DEFAULT (datetime('now')),
-  FOREIGN KEY (resident_id)    REFERENCES residents(id),
-  FOREIGN KEY (property_id)    REFERENCES properties(id),
-  FOREIGN KEY (catalog_item_id) REFERENCES addon_catalog(id),
-  FOREIGN KEY (recorded_by)    REFERENCES users(id)
-);
-
--- ── Receipts ──────────────────────────────────────────────
-CREATE TABLE IF NOT EXISTS receipts (
-  id                TEXT PRIMARY KEY,
-  property_id       TEXT NOT NULL,
-  resident_id       TEXT NOT NULL,
-  payment_ledger_id TEXT NOT NULL,
-  receipt_number    TEXT NOT NULL UNIQUE,
-  amount_paise      INTEGER NOT NULL,
-  line_items        TEXT NOT NULL DEFAULT '[]',
-  wa_delivered      INTEGER NOT NULL DEFAULT 0,
-  wa_delivered_at   TEXT,
-  pdf_path          TEXT,
-  created_at        TEXT NOT NULL DEFAULT (datetime('now')),
-  FOREIGN KEY (property_id)       REFERENCES properties(id),
-  FOREIGN KEY (resident_id)       REFERENCES residents(id),
-  FOREIGN KEY (payment_ledger_id) REFERENCES payment_ledger(id)
-);
-
--- ── Tenant Feedback ───────────────────────────────────────
-CREATE TABLE IF NOT EXISTS tenant_feedback (
-  id             TEXT PRIMARY KEY,
-  resident_id    TEXT NOT NULL,
-  property_id    TEXT NOT NULL,
-  invoice_id     TEXT NOT NULL,
-  rating         TEXT NOT NULL CHECK (rating IN ('good','average','needs_help')),
-  is_flagged     INTEGER NOT NULL DEFAULT 0,
-  followup_notes TEXT,
-  resolved_at    TEXT,
-  created_at     TEXT NOT NULL DEFAULT (datetime('now')),
-  FOREIGN KEY (resident_id) REFERENCES residents(id),
-  FOREIGN KEY (property_id) REFERENCES properties(id),
-  UNIQUE (invoice_id)
-);
-
--- ── WhatsApp Notification Log ─────────────────────────────
-CREATE TABLE IF NOT EXISTS notification_log (
-  id              TEXT PRIMARY KEY,
-  property_id     TEXT NOT NULL,
-  resident_id     TEXT,
-  recipient_mobile TEXT NOT NULL,
-  recipient_type  TEXT NOT NULL DEFAULT 'tenant',
-  event_type      TEXT NOT NULL,
-  message_body    TEXT NOT NULL,
-  status          TEXT NOT NULL DEFAULT 'pending'
-                    CHECK (status IN ('pending','sent','delivered','failed')),
-  provider_msg_id TEXT,
-  sent_at         TEXT,
-  created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-  FOREIGN KEY (property_id) REFERENCES properties(id)
-);
-
--- ── Indexes ───────────────────────────────────────────────
-CREATE INDEX IF NOT EXISTS idx_accounts_mobile       ON accounts(owner_mobile);
-CREATE INDEX IF NOT EXISTS idx_accounts_plan         ON accounts(plan);
-CREATE INDEX IF NOT EXISTS idx_beds_property         ON beds(property_id);
-CREATE INDEX IF NOT EXISTS idx_beds_status           ON beds(status);
-CREATE INDEX IF NOT EXISTS idx_residents_property    ON residents(property_id);
-CREATE INDEX IF NOT EXISTS idx_residents_status      ON residents(status);
-CREATE INDEX IF NOT EXISTS idx_residents_bed         ON residents(bed_id, status);
-CREATE INDEX IF NOT EXISTS idx_ledger_resident       ON payment_ledger(resident_id);
-CREATE INDEX IF NOT EXISTS idx_ledger_property_date  ON payment_ledger(property_id, paid_at);
-CREATE INDEX IF NOT EXISTS idx_ledger_approval       ON payment_ledger(approval_status, type);
-CREATE INDEX IF NOT EXISTS idx_audit_property_date   ON audit_log(property_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_expenses_property     ON expenses(property_id, expense_date);
-CREATE INDEX IF NOT EXISTS idx_notification_status   ON notification_log(status, created_at);
-CREATE INDEX IF NOT EXISTS idx_booking_status        ON booking_requests(status, lock_expires_at);
-CREATE INDEX IF NOT EXISTS idx_feedback_property     ON tenant_feedback(property_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_receipts_number       ON receipts(receipt_number);
-CREATE INDEX IF NOT EXISTS idx_doc_access_resident   ON document_access_log(resident_id);
-CREATE INDEX IF NOT EXISTS idx_otp_mobile            ON otp_store(mobile, expires_at);
+-- ── Document Access Log (DPDP compliance)
