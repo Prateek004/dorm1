@@ -5,14 +5,6 @@ const PDFKit   = require('pdfkit');
 const { getDb } = require('../db/connection');
 const { writeAudit } = require('../middleware/auditLog');
 
-/**
- * GET /api/v1/dashboard/summary
- *
- * FIX: Replaced COUNT(*) FILTER (WHERE ...) with SUM(CASE WHEN ... END).
- * FILTER syntax is PostgreSQL-native and only works in SQLite ≥ 3.30.0.
- * SUM(CASE) works on every SQLite version — eliminates the "shows 0" bug
- * if the bundled SQLite is older.
- */
 function getDashboard(req, res) {
   const db         = getDb();
   const propertyId = req.user.property_id;
@@ -39,7 +31,6 @@ function getDashboard(req, res) {
   ).get(propertyId);
 
   let financial = null;
-  // Only expose financial data to manager+ roles
   if (req.user.role !== 'reception') {
     const todayCollection = db.prepare(`
       SELECT COALESCE(SUM(amount_paise),0) as total_paise FROM payment_ledger
@@ -75,18 +66,15 @@ function getDashboard(req, res) {
     };
   }
 
-  const data = {
+  return res.json({
     occupancy,
     active_residents: activeResidents.count,
     pending_refunds:  pendingRefunds.count,
     pending_refunds_total_paise: pendingRefunds.total_paise,
     ...(financial || { note: 'Financial data restricted to manager and above' }),
-  };
-
-  return res.json(data);
+  });
 }
 
-/** GET /api/v1/expenses */
 function listExpenses(req, res) {
   const db = getDb();
   const { from, to, category } = req.query;
@@ -99,7 +87,6 @@ function listExpenses(req, res) {
   return res.json(db.prepare(q).all(...params));
 }
 
-/** POST /api/v1/expenses */
 function addExpense(req, res) {
   const { v4: uuidv4 } = require('uuid');
   const db = getDb();
@@ -131,12 +118,7 @@ function addExpense(req, res) {
   return res.status(201).json(db.prepare('SELECT * FROM expenses WHERE id=?').get(id));
 }
 
-/**
- * PATCH /api/v1/expenses/:id
- * Fix a wrong expense entry. Owner only.
- */
 function updateExpense(req, res) {
-  const { v4: uuidv4 } = require('uuid');
   const db = getDb();
   const propertyId = req.user.property_id;
 
@@ -145,7 +127,6 @@ function updateExpense(req, res) {
   if (!expense) return res.status(404).json({ error: 'Expense not found' });
 
   const { category, description, amount_paise, expense_date, payment_mode } = req.body;
-
   const newAmount = amount_paise !== undefined ? Math.round(parseFloat(amount_paise)) : expense.amount_paise;
   if (newAmount <= 0) return res.status(400).json({ error: 'amount_paise must be > 0' });
 
@@ -169,10 +150,6 @@ function updateExpense(req, res) {
   return res.json(db.prepare('SELECT * FROM expenses WHERE id=?').get(req.params.id));
 }
 
-/**
- * DELETE /api/v1/expenses/:id
- * Remove a wrong expense entry. Owner only.
- */
 function deleteExpense(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
@@ -194,10 +171,14 @@ function deleteExpense(req, res) {
   return res.json({ message: 'Expense deleted' });
 }
 
-/**
- * PATCH /api/v1/properties/settings
- * Owner updates property configuration.
- */
+/** GET /api/v1/properties/settings — read current property config */
+function getPropertySettings(req, res) {
+  const db = getDb();
+  const prop = db.prepare('SELECT * FROM properties WHERE id = ?').get(req.user.property_id);
+  if (!prop) return res.status(404).json({ error: 'Property not found' });
+  return res.json(prop);
+}
+
 function updatePropertySettings(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
@@ -249,11 +230,13 @@ function updatePropertySettings(req, res) {
   return res.json(db.prepare('SELECT * FROM properties WHERE id = ?').get(propertyId));
 }
 
-/** GET /api/v1/reports/summary */
 function reportSummary(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
-  const { from = new Date().toISOString().substring(0,7) + '-01', to = new Date().toISOString().substring(0,10) } = req.query;
+  const {
+    from = new Date().toISOString().substring(0,7) + '-01',
+    to   = new Date().toISOString().substring(0,10),
+  } = req.query;
 
   const revenue = db.prepare(`
     SELECT type, COALESCE(SUM(amount_paise),0) as total_paise
@@ -279,13 +262,16 @@ function reportSummary(req, res) {
   `).all(propertyId, from, to);
 
   return res.json({
-    from, to, total_revenue_paise: totalRevenue,
-    total_expenses_paise: totalExpenses, net_paise: totalRevenue - totalExpenses,
-    revenue_by_type: revenue, expenses_by_category: expenses, payments,
+    from, to,
+    total_revenue_paise:  totalRevenue,
+    total_expenses_paise: totalExpenses,
+    net_paise:            totalRevenue - totalExpenses,
+    revenue_by_type:      revenue,
+    expenses_by_category: expenses,
+    payments,
   });
 }
 
-/** GET /api/v1/reports/export  – owner only (enforced at route level) */
 async function reportExport(req, res) {
   const db = getDb();
   const propertyId = req.user.property_id;
@@ -396,11 +382,11 @@ async function reportExport(req, res) {
         `${e.expense_date} | ${e.category} | ₹${(e.amount_paise/100).toFixed(2)} | ${e.description || ''}`
       );
     });
-    const totalRev = payments.filter(p=>p.direction==='credit').reduce((s,p)=>s+p.amount_paise,0);
-    const totalExp = expenses.reduce((s,e)=>s+e.amount_paise,0);
+    const totalRev = payments.filter(p => p.direction === 'credit').reduce((s, p) => s + p.amount_paise, 0);
+    const totalExp = expenses.reduce((s, e) => s + e.amount_paise, 0);
     doc.moveDown().fontSize(12).text(`Total Revenue: ₹${(totalRev/100).toFixed(2)}`);
     doc.text(`Total Expenses: ₹${(totalExp/100).toFixed(2)}`);
-    doc.text(`Net: ₹${((totalRev-totalExp)/100).toFixed(2)}`);
+    doc.text(`Net: ₹${((totalRev - totalExp)/100).toFixed(2)}`);
     doc.end();
     return;
   }
@@ -408,7 +394,6 @@ async function reportExport(req, res) {
   return res.status(400).json({ error: 'format must be csv, xlsx, or pdf' });
 }
 
-/** GET /api/v1/audit */
 function getAuditLog(req, res) {
   const db = getDb();
   const { from, to, actor, entity_type } = req.query;
@@ -428,5 +413,6 @@ function getAuditLog(req, res) {
 
 module.exports = {
   getDashboard, listExpenses, addExpense, updateExpense, deleteExpense,
-  updatePropertySettings, reportSummary, reportExport, getAuditLog,
+  getPropertySettings, updatePropertySettings,
+  reportSummary, reportExport, getAuditLog,
 };
