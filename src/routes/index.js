@@ -3,7 +3,7 @@
 const express = require('express');
 const router  = express.Router();
 
-const { authenticate, requireRole, sameProperty, assertOwnsResource } = require('../middleware/auth');
+const { authenticate, requireRole, requireSuperAdmin, sameProperty, assertOwnsResource } = require('../middleware/auth');
 
 const auth       = require('../controllers/authController');
 const beds       = require('../controllers/bedsController');
@@ -16,11 +16,22 @@ const reconcile  = require('../controllers/reconciliationController');
 const addons     = require('../controllers/addonsController');
 const feedback   = require('../controllers/feedbackController');
 const receipts   = require('../controllers/receiptsController');
+const admin      = require('../controllers/adminController');
 
-// ── Auth ──────────────────────────────────────────────────
+// ── Auth (public) ──────────────────────────────────────────
 router.post('/auth/login',           auth.login);
+router.post('/auth/register',        auth.register);
+router.post('/auth/forgot-password', auth.forgotPassword);
+router.post('/auth/reset-password',  auth.resetPassword);
 router.get ('/auth/me',              authenticate, auth.me);
 router.post('/auth/change-password', authenticate, auth.changePassword);
+
+// ── Super-admin ────────────────────────────────────────────
+router.get  ('/admin/stats',                authenticate, requireSuperAdmin, admin.adminStats);
+router.get  ('/admin/accounts',             authenticate, requireSuperAdmin, admin.listAccounts);
+router.get  ('/admin/accounts/:id',         authenticate, requireSuperAdmin, admin.getAccount);
+router.patch('/admin/accounts/:id/suspend', authenticate, requireSuperAdmin, admin.suspendAccount);
+router.patch('/admin/accounts/:id/activate',authenticate, requireSuperAdmin, admin.activateAccount);
 
 // ── Dashboard ─────────────────────────────────────────────
 router.get('/dashboard/summary', authenticate, sameProperty, finance.getDashboard);
@@ -111,31 +122,23 @@ router.post('/cron/release-expired-bookings', verifyCronSecret, bookings.release
 function verifyCronSecret(req, res, next) {
   const secret = process.env.CRON_SECRET;
   if (!secret) {
-    if (process.env.NODE_ENV !== 'test') {
-      console.warn('[SECURITY] CRON_SECRET not set — cron endpoint is disabled until configured');
-    }
+    if (process.env.NODE_ENV !== 'test') console.warn('[SECURITY] CRON_SECRET not set');
     return res.status(401).json({ error: 'Cron endpoint requires CRON_SECRET to be configured' });
   }
-  if (req.headers['x-cron-secret'] !== secret) {
-    return res.status(401).json({ error: 'Invalid cron secret' });
-  }
+  if (req.headers['x-cron-secret'] !== secret) return res.status(401).json({ error: 'Invalid cron secret' });
   next();
 }
 
 function verifyWebhookSecret(req, res, next) {
   const secret = process.env.WEBHOOK_SECRET;
   if (!secret) {
-    if (process.env.NODE_ENV !== 'test') {
-      console.warn('[SECURITY] WEBHOOK_SECRET not set — webhook endpoint is disabled until configured');
-    }
+    if (process.env.NODE_ENV !== 'test') console.warn('[SECURITY] WEBHOOK_SECRET not set');
     return res.status(401).json({ error: 'Webhook endpoint requires WEBHOOK_SECRET to be configured' });
   }
-  if (req.headers['x-webhook-secret'] !== secret) {
-    return res.status(401).json({ error: 'Invalid webhook secret' });
-  }
+  if (req.headers['x-webhook-secret'] !== secret) return res.status(401).json({ error: 'Invalid webhook secret' });
   next();
 }
 
-router.get('/health', (req, res) => res.json({ status: 'ok', version: '3.0.0', timestamp: new Date().toISOString() }));
+router.get('/health', (req, res) => res.json({ status: 'ok', version: '4.0.0', timestamp: new Date().toISOString() }));
 
 module.exports = router;
