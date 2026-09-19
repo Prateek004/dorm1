@@ -6,7 +6,28 @@ const { writeAudit } = require('../middleware/auditLog');
 const { scheduleWhatsApp } = require('../services/whatsappService');
 const { generateReceipt } = require('../services/receiptService');
 
-function paise(v) { return Math.round(parseFloat(v || 0)); }
+const VALID_PAYMENT_MODES = ['cash', 'upi', 'card', 'bank_transfer'];
+const VALID_TYPES = ['rent', 'advance', 'extra_charge', 'deposit'];
+
+/**
+ * Parse an integer paise value from request body.
+ * Returns null for any non-numeric, NaN, Infinity, or non-positive-integer input.
+ * Never returns NaN. Never crashes.
+ */
+function parsePaise(v) {
+  if (v === undefined || v === null || v === '') return null;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  return Math.round(n);
+}
+
+/** Cap a text field. Returns null for missing/empty, truncated string otherwise. */
+function text(v, max) {
+  if (v === undefined || v === null) return null;
+  const s = String(v).trim();
+  if (!s) return null;
+  return s.substring(0, max);
+}
 
 /**
  * POST /api/v1/payments
@@ -22,12 +43,21 @@ function recordPayment(req, res) {
   } = req.body;
 
   if (!resident_id) return res.status(400).json({ error: 'resident_id is required' });
-  const amtPaise = paise(amount_paise);
-  if (!amtPaise || amtPaise <= 0) return res.status(400).json({ error: 'amount_paise must be > 0' });
 
-  const VALID_TYPES = ['rent', 'advance', 'extra_charge', 'deposit'];
+  const amtPaise = parsePaise(amount_paise);
+  if (amtPaise === null) return res.status(400).json({ error: 'amount_paise must be a number' });
+  if (amtPaise <= 0) return res.status(400).json({ error: 'amount_paise must be > 0' });
+
   if (!VALID_TYPES.includes(type)) {
     return res.status(400).json({ error: `type must be one of: ${VALID_TYPES.join(', ')}` });
+  }
+
+  if (!VALID_PAYMENT_MODES.includes(payment_mode)) {
+    return res.status(400).json({ error: `payment_mode must be one of: ${VALID_PAYMENT_MODES.join(', ')}` });
+  }
+
+  if (billing_month && !/^\d{4}-\d{2}$/.test(billing_month)) {
+    return res.status(400).json({ error: 'billing_month must be in YYYY-MM format' });
   }
 
   const resident = db.prepare(
@@ -37,6 +67,8 @@ function recordPayment(req, res) {
 
   const now = new Date().toISOString();
   const paymentId = uuidv4();
+  const safeGatewayTxnId = text(gateway_txn_id, 128);
+  const safeNotes        = text(notes, 500);
 
   db.prepare(`
     INSERT INTO payment_ledger
@@ -47,8 +79,8 @@ function recordPayment(req, res) {
   `).run(
     paymentId, propertyId, resident_id,
     billing_month || now.substring(0, 7),
-    amtPaise, type, payment_mode, gateway_txn_id || null,
-    due_date || null, now, notes || null, req.user.id, now
+    amtPaise, type, payment_mode, safeGatewayTxnId,
+    due_date || null, now, safeNotes, req.user.id, now
   );
 
   writeAudit({
@@ -59,7 +91,7 @@ function recordPayment(req, res) {
     ip: req.ip,
   });
 
-  // Generate receipt async
+  // Generate receipt async — errors must never crash the request
   generateReceipt({ db, paymentId, propertyId, residentId: resident_id, actorId: req.user.id })
     .then(receipt => {
       if (receipt && resident.mobile) {
@@ -97,10 +129,10 @@ function getResidentLedger(req, res) {
     'SELECT * FROM payment_ledger WHERE resident_id = ? ORDER BY created_at DESC'
   ).all(residentId);
 
-  const totalPaid      = ledger.filter(l => l.direction === 'credit').reduce((s, l) => s + l.amount_paise, 0);
-  const totalRefunded  = ledger.filter(l => l.direction === 'debit').reduce((s, l) => s + l.amount_paise, 0);
-  const balance        = totalPaid - totalRefunded;
-  const pendingApproval= ledger.filter(l => l.approval_status === 'pending');
+  const totalPaid       = ledger.filter(l => l.direction === 'credit').reduce((s, l) => s + l.amount_paise, 0);
+  const totalRefunded   = ledger.filter(l => l.direction === 'debit').reduce((s, l) => s + l.amount_paise, 0);
+  const balance         = totalPaid - totalRefunded;
+  const pendingApproval = ledger.filter(l => l.approval_status === 'pending');
 
   return res.json({
     resident,
@@ -147,7 +179,7 @@ function approvePayment(req, res) {
     UPDATE payment_ledger
     SET approval_status=?, approved_by=?, approved_at=?, notes=COALESCE(?,notes)
     WHERE id=?
-  `).run(decision, req.user.id, now, notes || null, req.params.id);
+  `).run(decision, req.user.id, now, text(notes, 500) || null, req.params.id);
 
   writeAudit({
     propertyId, userId: req.user.id,
@@ -168,9 +200,12 @@ function addRefundDeduction(req, res) {
   const residentId = req.params.id;
   const { amount_paise, reason } = req.body;
 
-  const amtPaise = paise(amount_paise);
-  if (!amtPaise || amtPaise <= 0) return res.status(400).json({ error: 'amount_paise must be > 0' });
-  if (!reason || !reason.trim()) return res.status(400).json({ error: 'reason is required' });
+  const amtPaise = parsePaise(amount_paise);
+  if (amtPaise === null) return res.status(400).json({ error: 'amount_paise must be a number' });
+  if (amtPaise <= 0) return res.status(400).json({ error: 'amount_paise must be > 0' });
+
+  const safeReason = text(reason, 500);
+  if (!safeReason) return res.status(400).json({ error: 'reason is required' });
 
   const resident = db.prepare(
     'SELECT id FROM residents WHERE id = ? AND property_id = ?'
@@ -181,21 +216,17 @@ function addRefundDeduction(req, res) {
   db.prepare(`
     INSERT INTO refund_deductions (id, resident_id, amount_paise, reason, logged_by, created_at)
     VALUES (?, ?, ?, ?, ?, datetime('now'))
-  `).run(id, residentId, amtPaise, reason.trim(), req.user.id);
+  `).run(id, residentId, amtPaise, safeReason, req.user.id);
 
-  return res.status(201).json({ id, resident_id: residentId, amount_paise: amtPaise, reason: reason.trim() });
+  return res.status(201).json({ id, resident_id: residentId, amount_paise: amtPaise, reason: safeReason });
 }
 
 /**
  * GET /api/v1/residents/:id/refund-summary
  *
- * FIX M-01: Previously computed dues as:
- *   max(0, monthly_rent_paise - SUM(all rent payments ever))
- * This made long-term residents show zero dues even if behind on current month.
- *
- * Fix: Compute outstanding dues per billing month across the resident's entire stay.
- * For each month from check_in to today, sum rent+advance credits. If any month
- * has credits < monthly_rent_paise, the shortfall is a blocking due.
+ * FIX M-01: Per-month outstanding dues calculation.
+ * For each month from check_in to today, sum rent+advance credits. Any month
+ * with credits < monthly_rent_paise contributes a blocking shortfall.
  */
 function getRefundSummary(req, res) {
   const db = getDb();
@@ -215,7 +246,6 @@ function getRefundSummary(req, res) {
     "SELECT COALESCE(SUM(amount_paise),0) as total FROM payment_ledger WHERE resident_id = ? AND type = 'extra_charge' AND direction = 'credit'"
   ).get(residentId);
 
-  // FIX M-01: Per-month outstanding dues calculation.
   const checkInMonth = resident.check_in_date ? resident.check_in_date.substring(0, 7) : null;
   const today = new Date().toISOString().substring(0, 10);
   const currentMonth = today.substring(0, 7);
