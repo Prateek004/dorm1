@@ -27,6 +27,7 @@
       <div class="loading-spinner"></div>
     </div>
 
+    <!-- LOGIN -->
     <div id="login-screen" class="screen hidden">
       <div class="auth-card">
         <div class="auth-logo">
@@ -52,10 +53,103 @@
           </div>
           <div id="login-error" class="error-msg hidden"></div>
           <button type="submit" id="login-btn" class="btn btn-primary btn-full">Sign In</button>
+          <div class="auth-links">
+            <a href="#" id="goto-forgot">Forgot password?</a>
+            <a href="#" id="goto-register">Create account →</a>
+          </div>
         </form>
       </div>
     </div>
 
+    <!-- REGISTER -->
+    <div id="register-screen" class="screen hidden">
+      <div class="auth-card">
+        <div class="auth-logo">
+          <svg width="40" height="40" viewBox="0 0 48 48" fill="none">
+            <rect width="48" height="48" rx="12" fill="#6366f1"/>
+            <path d="M12 36V14a2 2 0 012-2h20a2 2 0 012 2v22" stroke="white" stroke-width="2.5" stroke-linecap="round"/>
+            <rect x="18" y="22" width="5" height="5" rx="1" fill="white"/>
+            <rect x="25" y="22" width="5" height="5" rx="1" fill="white"/>
+            <rect x="18" y="30" width="5" height="5" rx="1" fill="white"/>
+            <rect x="25" y="30" width="5" height="5" rx="1" fill="white"/>
+          </svg>
+          <h1>Get Started</h1>
+          <p>30-day free trial • No credit card</p>
+        </div>
+        <form id="register-form" onsubmit="return false">
+          <div class="field">
+            <label for="reg-owner-name">Your Name</label>
+            <input id="reg-owner-name" type="text" placeholder="Rajesh Kumar" required />
+          </div>
+          <div class="field">
+            <label for="reg-mobile">Mobile Number</label>
+            <input id="reg-mobile" type="tel" placeholder="9876543210" maxlength="10" required />
+          </div>
+          <div class="field">
+            <label for="reg-pg-name">PG / Hostel Name</label>
+            <input id="reg-pg-name" type="text" placeholder="Sunrise PG" required />
+          </div>
+          <div class="field">
+            <label for="reg-business-name">Business Name</label>
+            <input id="reg-business-name" type="text" placeholder="Rajesh Properties" required />
+          </div>
+          <div class="field">
+            <label for="reg-city">City</label>
+            <input id="reg-city" type="text" placeholder="Bengaluru" />
+          </div>
+          <div class="field">
+            <label for="reg-email">Email (optional)</label>
+            <input id="reg-email" type="email" placeholder="owner@email.com" />
+          </div>
+          <div class="field">
+            <label for="reg-password">Password</label>
+            <input id="reg-password" type="password" placeholder="Min 8 characters" required />
+          </div>
+          <div id="register-error" class="error-msg hidden"></div>
+          <button type="submit" id="register-btn" class="btn btn-primary btn-full">Create Free Account</button>
+          <div class="auth-links">
+            <a href="#" id="goto-login">Already have an account? Sign in</a>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- FORGOT PASSWORD -->
+    <div id="forgot-screen" class="screen hidden">
+      <div class="auth-card">
+        <div class="auth-logo">
+          <h1>Reset Password</h1>
+          <p>We'll send an OTP to your WhatsApp</p>
+        </div>
+        <div id="forgot-step-1">
+          <form id="forgot-form" onsubmit="return false">
+            <div class="field">
+              <label for="forgot-mobile">Registered Mobile</label>
+              <input id="forgot-mobile" type="tel" placeholder="9876543210" maxlength="10" required />
+            </div>
+            <div id="forgot-error" class="error-msg hidden"></div>
+            <button type="submit" id="forgot-btn" class="btn btn-primary btn-full">Send OTP on WhatsApp</button>
+            <div class="auth-links"><a href="#" id="goto-login-2">Back to Sign In</a></div>
+          </form>
+        </div>
+        <div id="forgot-step-2" class="hidden">
+          <form id="reset-form" onsubmit="return false">
+            <div class="field">
+              <label for="reset-otp">6-digit OTP (check WhatsApp)</label>
+              <input id="reset-otp" type="text" placeholder="123456" maxlength="6" required />
+            </div>
+            <div class="field">
+              <label for="reset-password">New Password</label>
+              <input id="reset-password" type="password" placeholder="Min 8 characters" required />
+            </div>
+            <div id="reset-error" class="error-msg hidden"></div>
+            <button type="submit" id="reset-btn" class="btn btn-primary btn-full">Reset Password</button>
+          </form>
+        </div>
+      </div>
+    </div>
+
+    <!-- MAIN APP -->
     <div id="main-app" class="screen hidden">
       <nav class="sidebar" id="sidebar">
         <div class="sidebar-header">
@@ -101,7 +195,6 @@
   </div>
 
   <div id="toast-container" class="toast-container"></div>
-
   <script src="/js/app.js"></script>
 </body>
 </html>
