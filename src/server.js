@@ -6,9 +6,10 @@ const helmet  = require('helmet');
 const cors    = require('cors');
 const morgan  = require('morgan');
 
-const { initDb }         = require('./db/init');
-const routes             = require('./routes');
-const { startScheduler } = require('./services/scheduler');
+const { initDb, DB_PATH } = require('./db/init');
+const { setDb }           = require('./db/connection');
+const routes              = require('./routes');
+const { startScheduler }  = require('./services/scheduler');
 
 const app  = express();
 const PORT = process.env.PORT || 8080;
@@ -20,7 +21,7 @@ app.use(helmet({
     directives: {
       defaultSrc:    ["'self'"],
       scriptSrc:     ["'self'", "'unsafe-inline'"],
-      scriptSrcAttr: ["'unsafe-inline'"],          // ← allow onclick= in innerHTML
+      scriptSrcAttr: ["'unsafe-inline'"],
       styleSrc:      ["'self'", "'unsafe-inline'"],
       imgSrc:        ["'self'", 'data:', 'blob:'],
       connectSrc:    ["'self'"],
@@ -54,12 +55,11 @@ app.use((err, req, res, _next) => {
 (async () => {
   try {
     const db = initDb();
-    const { setDb } = require('./db/connection');
     setDb(db);
     startScheduler();
     app.listen(PORT, () => {
       console.log(`[SERVER] DormBook v3.0 on port ${PORT} (${ENV})`);
-      console.log(`[SERVER] DB: ${process.env.DATABASE_PATH || '/data/dormbook.db'}`);
+      console.log(`[SERVER] DB: ${DB_PATH}`);
     });
   } catch (err) {
     console.error('[BOOT ERROR]', err.message);
