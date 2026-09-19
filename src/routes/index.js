@@ -69,6 +69,7 @@ router.get   ('/reports/export',     authenticate, sameProperty, requireRole('ow
 router.get   ('/audit',              authenticate, sameProperty, requireRole('owner'),   finance.getAuditLog);
 
 // ── Property Settings ─────────────────────────────────────
+router.get  ('/properties/settings', authenticate, sameProperty, requireRole('owner'), finance.getPropertySettings);
 router.patch('/properties/settings', authenticate, sameProperty, requireRole('owner'), finance.updatePropertySettings);
 
 // ── Staff ─────────────────────────────────────────────────
@@ -107,9 +108,6 @@ router.get ('/receipts/:receipt_number/pdf',     authenticate, sameProperty, rec
 // ── Cron endpoints ────────────────────────────────────────
 router.post('/cron/release-expired-bookings', verifyCronSecret, bookings.releaseExpired);
 
-// FIX C-01 + C-02: Fail-closed guards.
-// Previously used `if (secret && ...)` which fails open when the env var is unset.
-// Now: if secret is not configured, deny ALL requests to these endpoints.
 function verifyCronSecret(req, res, next) {
   const secret = process.env.CRON_SECRET;
   if (!secret) {
