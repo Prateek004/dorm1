@@ -6,10 +6,11 @@ const helmet  = require('helmet');
 const cors    = require('cors');
 const morgan  = require('morgan');
 
-const { initDb, DB_PATH } = require('./db/init');
-const { setDb }           = require('./db/connection');
-const routes              = require('./routes');
-const { startScheduler }  = require('./services/scheduler');
+const { setDb } = require('./db/connection');
+const { initDb: openDb } = require('./db/init');
+const { autoSeedIfEmpty } = require('./db/seed');
+const routes        = require('./routes');
+const { startScheduler } = require('./services/scheduler');
 
 const app  = express();
 const PORT = process.env.PORT || 8080;
@@ -31,6 +32,7 @@ app.use(helmet({
 app.use(cors());
 app.use(express.json({ limit: '2mb' }));
 app.use(morgan(ENV === 'production' ? 'combined' : 'dev'));
+
 app.use(express.static(path.join(__dirname, '..', 'public')));
 app.use('/api/v1', routes);
 
@@ -45,15 +47,15 @@ app.use((err, req, res, _next) => {
 
 (async () => {
   try {
-    const db = initDb();
+    const db = openDb();
     setDb(db);
+    autoSeedIfEmpty(db);
     startScheduler();
     app.listen(PORT, () => {
-      console.log(`[SERVER] DormBook v3.0 on port ${PORT} (${ENV})`);
-      console.log(`[SERVER] DB: ${DB_PATH}`);
+      console.log(`[SERVER] DormBook v4.0 on port ${PORT} (${ENV})`);
     });
   } catch (err) {
-    console.error('[BOOT ERROR]', err.message);
+    console.error('[BOOT ERROR]', err.message, err.stack);
     process.exit(1);
   }
 })();
