@@ -1,6 +1,6 @@
 'use strict';
 /* ============================================================
-   DormBook v2 — Frontend SPA
+   DormBook v3 — Frontend SPA  (SaaS edition)
    API base: /api/v1
    All monetary display: paise ÷ 100 = rupees
    ============================================================ */
@@ -11,7 +11,6 @@ if ('serviceWorker' in navigator) {
     navigator.serviceWorker.register('/sw.js')
       .then(reg => {
         console.log('[SW] Registered:', reg.scope);
-        // Listen for sync complete messages
         navigator.serviceWorker.addEventListener('message', e => {
           if (e.data?.type === 'SYNC_COMPLETE') {
             toast(`Synced ${e.data.replayed} offline action(s)`, 'success');
@@ -45,7 +44,6 @@ async function api(method, path, body) {
 
 function rupees(paise) { return `₹${(Math.round(paise || 0) / 100).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`; }
 function fmtDate(d) { return d ? new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '—'; }
-// FIX: Escape strings for safe use in onclick="fn('...')" attributes
 function esc(s) { return String(s || '').replace(/\\/g,'\\\\').replace(/'/g,"\\'").replace(/"/g,'&quot;'); }
 
 // ── Toast ────────────────────────────────────────────────────
@@ -143,7 +141,7 @@ function titleFor(page) {
   const map = { dashboard:'Dashboard', beds:'Beds', checkin:'Check In', residents:'Residents',
     payments:'Payments', addons:'Add-on Charges', bookings:'Bookings', reconcile:'Cash Reconciliation',
     expenses:'Expenses', reports:'Reports', staff:'Staff', feedback:'Tenant Feedback',
-    catalog:'Add-on Catalog', audit:'Audit Log', settings:'Property Settings' };
+    catalog:'Add-on Catalog', audit:'Audit Log', settings:'Property Settings', admin:'Admin Panel' };
   return map[page] || page;
 }
 
@@ -151,54 +149,72 @@ function refreshCurrentPage() { if (STATE.currentPage) renderPage(STATE.currentP
 
 function closeSidebar() { document.getElementById('sidebar').classList.remove('open'); }
 
+// ── Screen helper ────────────────────────────────────────────
+function showScreen(id) {
+  ['login-screen', 'register-screen', 'forgot-screen', 'main-app', 'loading-screen'].forEach(s => {
+    const el = document.getElementById(s);
+    if (el) el.classList.add('hidden');
+  });
+  const target = document.getElementById(id);
+  if (target) target.classList.remove('hidden');
+}
+
 // ── Auth ─────────────────────────────────────────────────────
 async function init() {
-  // Show loading max 4s — then always fall through to login
-  const loadingTimer = setTimeout(() => showLogin(), 4000);
-
+  const loadingTimer = setTimeout(() => showScreen('login-screen'), 4000);
   try {
     const token = sessionStorage.getItem('db_token');
     const user  = JSON.parse(sessionStorage.getItem('db_user') || 'null');
     if (token && user) {
-      // Validate token is still accepted by server before showing app
       STATE.token = token;
       STATE.user  = user;
       try {
         await api('GET', '/auth/me');
         clearTimeout(loadingTimer);
         showApp();
-      } catch (err) {
-        // Token expired or DB restarted — clear and show login
+      } catch {
         sessionStorage.clear();
         STATE.token = null;
         STATE.user  = null;
         clearTimeout(loadingTimer);
-        showLogin();
+        showScreen('login-screen');
       }
     } else {
       clearTimeout(loadingTimer);
-      showLogin();
+      showScreen('login-screen');
     }
   } catch {
     clearTimeout(loadingTimer);
-    showLogin();
+    showScreen('login-screen');
   }
 }
 
+// ── Login ────────────────────────────────────────────────────
 let _loginListenerAttached = false;
-function showLogin() {
-  document.getElementById('loading-screen').classList.add('hidden');
-  document.getElementById('login-screen').classList.remove('hidden');
-  document.getElementById('main-app').classList.add('hidden');
-  // Guard against duplicate event listeners on re-render
+document.addEventListener('DOMContentLoaded', () => {
+  // Login
   if (!_loginListenerAttached) {
-    document.getElementById('login-btn').addEventListener('click', handleLogin);
-    document.getElementById('login-form').addEventListener('keydown', e => {
-      if (e.key === 'Enter') handleLogin(e);
-    });
+    document.getElementById('login-btn')?.addEventListener('click', handleLogin);
+    document.getElementById('login-form')?.addEventListener('keydown', e => { if (e.key === 'Enter') handleLogin(e); });
     _loginListenerAttached = true;
   }
-}
+
+  // Screen navigation links
+  document.getElementById('goto-register')?.addEventListener('click', e => { e.preventDefault(); showScreen('register-screen'); });
+  document.getElementById('goto-forgot')?.addEventListener('click',   e => { e.preventDefault(); showScreen('forgot-screen'); });
+  document.getElementById('goto-login')?.addEventListener('click',    e => { e.preventDefault(); showScreen('login-screen'); });
+  document.getElementById('goto-login-2')?.addEventListener('click',  e => { e.preventDefault(); showScreen('login-screen'); });
+
+  // Register form
+  document.getElementById('register-btn')?.addEventListener('click', handleRegister);
+  document.getElementById('register-form')?.addEventListener('keydown', e => { if (e.key === 'Enter') handleRegister(e); });
+
+  // Forgot password — step 1 (send OTP)
+  document.getElementById('forgot-send-btn')?.addEventListener('click', handleForgotSend);
+
+  // Forgot password — step 2 (reset with OTP)
+  document.getElementById('forgot-reset-btn')?.addEventListener('click', handleForgotReset);
+});
 
 async function handleLogin(e) {
   e.preventDefault();
@@ -228,15 +244,114 @@ async function handleLogin(e) {
   }
 }
 
+async function handleRegister(e) {
+  e?.preventDefault();
+  const btn = document.getElementById('register-btn');
+  const err = document.getElementById('register-error');
+  err.classList.add('hidden');
+  btn.disabled = true;
+  btn.textContent = 'Creating account…';
+  try {
+    const data = await api('POST', '/auth/register', {
+      business_name: document.getElementById('reg-business').value.trim(),
+      owner_name:    document.getElementById('reg-name').value.trim(),
+      mobile:        document.getElementById('reg-mobile').value.trim(),
+      email:         document.getElementById('reg-email').value.trim() || undefined,
+      password:      document.getElementById('reg-password').value,
+      pg_name:       document.getElementById('reg-pg-name').value.trim(),
+      city:          document.getElementById('reg-city').value.trim() || undefined,
+    });
+    STATE.token = data.token;
+    STATE.user  = data.user;
+    sessionStorage.setItem('db_token', data.token);
+    sessionStorage.setItem('db_user',  JSON.stringify(data.user));
+    toast(`Welcome, ${data.user.name}! Your 30-day trial has started.`, 'success', 6000);
+    showApp();
+  } catch (ex) {
+    err.textContent = ex.message || 'Registration failed';
+    err.classList.remove('hidden');
+    btn.disabled = false;
+    btn.textContent = 'Create Account';
+  }
+}
+
+// forgot step state
+let _forgotMobile = '';
+
+async function handleForgotSend(e) {
+  e?.preventDefault();
+  const btn = document.getElementById('forgot-send-btn');
+  const err = document.getElementById('forgot-error');
+  err.classList.add('hidden');
+  const mobile = document.getElementById('forgot-mobile').value.trim();
+  if (!mobile) { err.textContent = 'Enter your registered mobile number'; err.classList.remove('hidden'); return; }
+  btn.disabled = true;
+  btn.textContent = 'Sending…';
+  try {
+    await api('POST', '/auth/forgot-password', { mobile });
+    _forgotMobile = mobile;
+    // Show step 2
+    document.getElementById('forgot-step-1').classList.add('hidden');
+    document.getElementById('forgot-step-2').classList.remove('hidden');
+    toast('OTP sent to your WhatsApp', 'success');
+  } catch (ex) {
+    err.textContent = ex.message || 'Failed to send OTP';
+    err.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Send OTP';
+  }
+}
+
+async function handleForgotReset(e) {
+  e?.preventDefault();
+  const btn = document.getElementById('forgot-reset-btn');
+  const err = document.getElementById('forgot-reset-error');
+  err.classList.add('hidden');
+  const otp      = document.getElementById('forgot-otp').value.trim();
+  const password = document.getElementById('forgot-new-password').value;
+  if (!otp || !password) { err.textContent = 'Enter OTP and new password'; err.classList.remove('hidden'); return; }
+  btn.disabled = true;
+  btn.textContent = 'Resetting…';
+  try {
+    await api('POST', '/auth/reset-password', { mobile: _forgotMobile, otp, new_password: password });
+    toast('Password reset! Please log in.', 'success');
+    showScreen('login-screen');
+  } catch (ex) {
+    err.textContent = ex.message || 'Reset failed';
+    err.classList.remove('hidden');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Reset Password';
+  }
+}
+
 function showApp() {
-  document.getElementById('loading-screen').classList.add('hidden');
-  document.getElementById('login-screen').classList.add('hidden');
-  document.getElementById('main-app').classList.remove('hidden');
+  showScreen('main-app');
   document.getElementById('user-badge').textContent = `${STATE.user.name} · ${STATE.user.role}`;
-  document.getElementById('logout-btn').addEventListener('click', logout);
+  // Remove old listeners before adding (guard against double-attach after login → logout → login)
+  const logoutBtn = document.getElementById('logout-btn');
+  const newLogout = logoutBtn.cloneNode(true);
+  logoutBtn.parentNode.replaceChild(newLogout, logoutBtn);
+  newLogout.addEventListener('click', logout);
+
   document.getElementById('menu-toggle').addEventListener('click', () => {
     document.getElementById('sidebar').classList.toggle('open');
   });
+
+  // Superadmin gets its own nav + page
+  if (STATE.user.role === 'superadmin') {
+    document.getElementById('nav-list').innerHTML = `
+      <li><a href="#" data-page="admin" class="active">👑 Admin Panel</a></li>
+    `;
+    document.getElementById('nav-list').querySelector('[data-page=admin]').addEventListener('click', e => {
+      e.preventDefault(); navigate('admin'); closeSidebar();
+    });
+    navigate('admin');
+    if (!navigator.onLine) document.getElementById('offline-indicator')?.classList.remove('hidden');
+    return;
+  }
+
   buildNav();
   navigate('dashboard');
   if (!navigator.onLine) document.getElementById('offline-indicator')?.classList.remove('hidden');
@@ -257,7 +372,7 @@ async function renderPage(page) {
     switch (page) {
       case 'dashboard': await renderDashboard(el); break;
       case 'beds':      await renderBeds(el);      break;
-      case 'checkin':   renderCheckin(el);         break;
+      case 'checkin':   await renderCheckin(el);   break;
       case 'residents': await renderResidents(el); break;
       case 'payments':  await renderPayments(el);  break;
       case 'addons':    await renderAddons(el);    break;
@@ -270,6 +385,7 @@ async function renderPage(page) {
       case 'catalog':   await renderCatalog(el);   break;
       case 'audit':     await renderAudit(el);     break;
       case 'settings':  await renderSettings(el);  break;
+      case 'admin':     await renderAdminPanel(el); break;
       default:          el.innerHTML = '<div class="empty-state"><p>Page not found</p></div>';
     }
   } catch (ex) {
@@ -356,7 +472,6 @@ async function renderBeds(el) {
     return;
   }
 
-  // Count totals
   let totalBeds = 0, totalOccupied = 0, totalAvail = 0;
   floors.forEach(f => f.rooms.forEach(rm => {
     totalBeds += rm.total_beds;
@@ -386,8 +501,6 @@ function switchFloor(idx) {
   const floor = window._floorData[idx];
   if (!floor) return;
   const fc = document.getElementById('floor-content');
-  const isOwner = STATE.user.role === 'owner';
-
   fc.innerHTML = floor.rooms.length ? floor.rooms.map(rm => `
     <div class="card mb-12">
       <div class="flex-between mb-12">
@@ -508,7 +621,6 @@ async function showBedDetail(bedId) {
 
 function navigateCheckinForBed(bedId) {
   navigate('checkin');
-  // Wait for the form to render, then pre-select the bed
   setTimeout(() => {
     const sel = document.getElementById('ci-bed');
     if (sel) { sel.value = bedId; sel.dispatchEvent(new Event('change')); }
@@ -564,7 +676,6 @@ async function submitAddBed() {
 
 // ── Check In ─────────────────────────────────────────────────
 async function renderCheckin(el) {
-  // FIX: Load both available AND reserved beds (reserved = confirmed booking ready for check-in)
   const [avail, reserved] = await Promise.all([
     api('GET', '/beds?status=available'),
     api('GET', '/beds?status=reserved'),
@@ -646,13 +757,11 @@ async function renderCheckin(el) {
       </form>
     </div>
   `;
-  // Auto-fill rate from bed daily rate when bed selection or rate_type changes
-  const bedSelect = document.getElementById('ci-bed');
-  const rentInput = document.getElementById('ci-rent');
+  const bedSelect    = document.getElementById('ci-bed');
+  const rentInput    = document.getElementById('ci-rent');
   const rateTypeSelect = document.getElementById('ci-rate-type');
-  window._bedRates = {}; // store daily rates per bed
+  window._bedRates = {};
   if (bedSelect) {
-    // Build rate lookup from bed options
     beds.forEach(b => { window._bedRates[b.id] = b.daily_rate_paise || 0; });
     function fillRate() {
       const bedId = bedSelect.value;
@@ -711,7 +820,7 @@ async function submitCheckin() {
       notes:                  document.getElementById('ci-notes').value.trim(),
       aadhaar_consent:        document.getElementById('ci-consent').checked,
     };
-    const result = await api('POST', '/residents', data);
+    await api('POST', '/residents', data);
     toast(`${data.full_name} checked in successfully!`, 'success');
     navigate('residents');
   } catch(ex) {
@@ -801,7 +910,7 @@ async function showResidentDetail(id) {
               <tr>
                 <td>${fmtDate(p.paid_at)}</td>
                 <td>${p.type}</td>
-                <td class="${p.direction==='credit'?'ledger-credit':'ledger-debit'}">${p.direction===  'credit'?'+':'-'}${rupees(p.amount_paise)}</td>
+                <td class="${p.direction==='credit'?'ledger-credit':'ledger-debit'}">${p.direction==='credit'?'+':'-'}${rupees(p.amount_paise)}</td>
                 <td>${p.payment_mode}</td>
                 <td><span class="badge badge-${p.approval_status==='approved'||p.approval_status==='not_required'?'success':p.approval_status==='pending'?'warning':'danger'}">${p.approval_status}</span></td>
               </tr>
@@ -917,7 +1026,6 @@ async function renderPayments(el) {
   `;
 }
 
-// FIX: showPaymentModal was called from resident detail but never defined
 function showPaymentModal(residentId, residentName) {
   openModal(`Record Payment: ${residentName}`, `
     <input type="hidden" id="pm-resident" value="${residentId}" />
@@ -1258,7 +1366,6 @@ async function renderReports(el) {
   `;
 }
 
-// FIX: Download export with auth token (bare <a> tags don't send Bearer token)
 async function downloadReport(format, from, to) {
   try {
     const res = await fetch(`/api/v1/reports/export?format=${format}&from=${from}&to=${to}`, {
@@ -1278,13 +1385,9 @@ async function downloadReport(format, from, to) {
 
 // ── Property Settings (owner only) ────────────────────────────
 async function renderSettings(el) {
-  const prop = await api('GET', '/dashboard/summary').catch(() => null);
-  // Fetch current property data by using a lightweight call
   let settings;
   try {
-    // The settings are returned when we PATCH, but for reading we need the current values
-    // We'll fetch via a dummy patch that changes nothing, or show the form with current known values
-settings = await api('GET', '/properties/settings');
+    settings = await api('GET', '/properties/settings');
   } catch(ex) {
     el.innerHTML = `<div class="error-msg">Could not load settings: ${ex.message}</div>`;
     return;
@@ -1511,6 +1614,75 @@ async function renderAudit(el) {
       </table>
     </div>
   `;
+}
+
+// ── Admin Panel (superadmin only) ────────────────────────────
+async function renderAdminPanel(el) {
+  const [stats, accounts] = await Promise.all([
+    api('GET', '/admin/stats'),
+    api('GET', '/admin/accounts'),
+  ]);
+
+  el.innerHTML = `
+    <div class="stat-grid mb-20">
+      <div class="stat-card"><div class="stat-label">Total Accounts</div><div class="stat-value">${stats.total_accounts}</div></div>
+      <div class="stat-card warning"><div class="stat-label">On Trial</div><div class="stat-value">${stats.trial_accounts}</div></div>
+      <div class="stat-card success"><div class="stat-label">Active (Paid)</div><div class="stat-value">${stats.active_accounts}</div></div>
+      <div class="stat-card danger"><div class="stat-label">Suspended</div><div class="stat-value">${stats.suspended_accounts}</div></div>
+      <div class="stat-card"><div class="stat-label">Expired Trials</div><div class="stat-value">${stats.expired_trials}</div></div>
+      <div class="stat-card accent"><div class="stat-label">Live Residents</div><div class="stat-value">${stats.total_active_residents}</div></div>
+    </div>
+    <div class="card table-wrap">
+      <strong>All Accounts</strong>
+      <div class="table-wrap mt-12">
+        <table>
+          <thead><tr>
+            <th>Business</th><th>Owner</th><th>Mobile</th><th>Plan</th>
+            <th>Trial Ends</th><th>Properties</th><th>Residents</th><th>Actions</th>
+          </tr></thead>
+          <tbody>
+            ${accounts.map(a => `
+              <tr>
+                <td><div class="td-name">${a.business_name}</div></td>
+                <td>${a.owner_name}</td>
+                <td>${a.owner_mobile}</td>
+                <td>
+                  <span class="badge ${a.plan==='active'?'badge-success':a.plan==='trial'?'badge-warning':'badge-danger'}">
+                    ${a.plan}
+                  </span>
+                </td>
+                <td>${fmtDate(a.trial_ends_at)}</td>
+                <td>${a.property_count}</td>
+                <td>${a.active_residents}</td>
+                <td>
+                  ${a.plan !== 'active' ? `<button class="btn btn-success btn-sm" onclick="adminActivate('${a.id}')">Activate</button>` : ''}
+                  ${a.plan !== 'suspended' ? `<button class="btn btn-danger btn-sm" onclick="adminSuspend('${a.id}')">Suspend</button>` : ''}
+                </td>
+              </tr>
+            `).join('')}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+async function adminActivate(id) {
+  if (!confirm('Activate this account? Trial will be extended 30 days from today.')) return;
+  try {
+    await api('PATCH', `/admin/accounts/${id}/activate`);
+    toast('Account activated', 'success');
+    renderPage('admin');
+  } catch(ex) { toast(ex.message, 'error'); }
+}
+
+async function adminSuspend(id) {
+  const reason = prompt('Reason for suspension (optional):') ?? '';
+  try {
+    await api('PATCH', `/admin/accounts/${id}/suspend`, { reason });
+    toast('Account suspended', 'warning');
+    renderPage('admin');
+  } catch(ex) { toast(ex.message, 'error'); }
 }
 
 // ── Boot ──────────────────────────────────────────────────────
